@@ -142,6 +142,9 @@ pub fn run(command: TunCommand) -> Result<()> {
 
 fn cmd_doctor() -> Result<()> {
     ensure_linux_host()?;
+    if ensure_tun_doctor_privileges_or_delegate()? == PrivilegeCheck::Delegated {
+        return Ok(());
+    }
     if !is_json_mode() {
         println!("开始执行 tun 诊断...");
     }
@@ -1244,6 +1247,7 @@ fn ensure_tun_privileges() -> Result<()> {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum TunAction {
+    Doctor,
     On,
     Off,
 }
@@ -1251,6 +1255,7 @@ enum TunAction {
 impl TunAction {
     fn as_cli_str(self) -> &'static str {
         match self {
+            TunAction::Doctor => "doctor",
             TunAction::On => "on",
             TunAction::Off => "off",
         }
@@ -1280,7 +1285,7 @@ fn ensure_tun_privileges_or_delegate(action: TunAction, args: &TunApplyArgs) -> 
         );
     }
 
-    let status = run_tun_with_sudo(action, args).context("调用 sudo 执行 tun 命令失败")?;
+    let status = run_tun_apply_with_sudo(action, args).context("调用 sudo 执行 tun 命令失败")?;
     if status.success() {
         return Ok(PrivilegeCheck::Delegated);
     }
@@ -1289,6 +1294,26 @@ fn ensure_tun_privileges_or_delegate(action: TunAction, args: &TunApplyArgs) -> 
         "sudo 授权未通过或命令执行失败，请手动执行: sudo clash tun {}",
         action.as_cli_str()
     );
+}
+
+fn ensure_tun_doctor_privileges_or_delegate() -> Result<PrivilegeCheck> {
+    if ensure_tun_privileges().is_ok() {
+        return Ok(PrivilegeCheck::Ok);
+    }
+
+    if !should_auto_delegate_to_sudo() {
+        return Ok(PrivilegeCheck::Ok);
+    }
+
+    if !is_json_mode() {
+        println!("检测到权限不足，正在请求 sudo 授权继续执行 `clash tun doctor` ...");
+    }
+
+    let status = run_tun_doctor_with_sudo().context("调用 sudo 执行 tun doctor 失败")?;
+    if status.success() {
+        return Ok(PrivilegeCheck::Delegated);
+    }
+    bail!("sudo 授权未通过或命令执行失败，请手动执行: sudo clash tun doctor");
 }
 
 fn should_auto_delegate_to_sudo() -> bool {
@@ -1307,7 +1332,7 @@ fn should_auto_delegate_to_sudo() -> bool {
     command_exists("sudo")
 }
 
-fn run_tun_with_sudo(action: TunAction, args: &TunApplyArgs) -> Result<std::process::ExitStatus> {
+fn build_sudo_reexec_command() -> Result<Command> {
     let exe = std::env::current_exe().context("获取当前可执行文件路径失败")?;
     let mut cmd = Command::new("sudo");
     cmd.arg("env");
@@ -1319,6 +1344,11 @@ fn run_tun_with_sudo(action: TunAction, args: &TunApplyArgs) -> Result<std::proc
     if is_json_mode() {
         cmd.arg("--json");
     }
+    Ok(cmd)
+}
+
+fn run_tun_apply_with_sudo(action: TunAction, args: &TunApplyArgs) -> Result<std::process::ExitStatus> {
+    let mut cmd = build_sudo_reexec_command()?;
     cmd.arg("tun");
     cmd.arg(action.as_cli_str());
     cmd.arg("--name");
@@ -1329,6 +1359,13 @@ fn run_tun_with_sudo(action: TunAction, args: &TunApplyArgs) -> Result<std::proc
     if args.no_restart {
         cmd.arg("--no-restart");
     }
+    let status = cmd.status().context("启动 sudo 失败")?;
+    Ok(status)
+}
+
+fn run_tun_doctor_with_sudo() -> Result<std::process::ExitStatus> {
+    let mut cmd = build_sudo_reexec_command()?;
+    cmd.arg("tun").arg(TunAction::Doctor.as_cli_str());
     let status = cmd.status().context("启动 sudo 失败")?;
     Ok(status)
 }

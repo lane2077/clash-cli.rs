@@ -169,6 +169,8 @@ pub enum ApiModeCommand {
 pub enum SetupCommand {
     #[command(about = "一键初始化（内核 + 订阅 + 渲染 + service + tun）")]
     Init(SetupInitArgs),
+    #[command(about = "收敛历史配置到系统目录（/etc/clash-cli）并可选应用")]
+    Unify(SetupUnifyArgs),
 }
 
 #[derive(Args, Clone)]
@@ -409,6 +411,14 @@ pub struct SetupInitArgs {
     pub service_name: String,
     #[arg(long, help = "初始化完成后不自动开启 tun")]
     pub no_tun: bool,
+}
+
+#[derive(Args, Clone)]
+pub struct SetupUnifyArgs {
+    #[arg(long, default_value = DEFAULT_SERVICE_NAME, help = "联动重启的 systemd 服务名")]
+    pub service_name: String,
+    #[arg(long, help = "仅收敛 profile，不渲染与重启服务")]
+    pub no_apply: bool,
 }
 
 #[derive(Args, Clone)]
