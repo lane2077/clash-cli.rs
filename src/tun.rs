@@ -238,6 +238,7 @@ fn cmd_doctor() -> Result<()> {
 
 fn cmd_on(args: TunApplyArgs) -> Result<()> {
     ensure_linux_host()?;
+    ensure_tun_privileges()?;
     let json_mode = is_json_mode();
 
     if !Path::new("/dev/net/tun").exists() {
@@ -347,6 +348,7 @@ fn cmd_on(args: TunApplyArgs) -> Result<()> {
 
 fn cmd_off(args: TunApplyArgs) -> Result<()> {
     ensure_linux_host()?;
+    ensure_tun_privileges()?;
     let json_mode = is_json_mode();
     let paths = app_paths()?;
     let mut root = load_or_init_config(&paths.runtime_config_file)?;
@@ -1221,6 +1223,35 @@ fn read_cap_eff() -> Result<u64> {
         }
     }
     bail!("未找到 CapEff 字段")
+}
+
+fn ensure_tun_privileges() -> Result<()> {
+    let is_root = is_root_user().unwrap_or(false);
+    let has_admin = has_capability_bit(CAP_NET_ADMIN_BIT).unwrap_or(false);
+    let has_raw = has_capability_bit(CAP_NET_RAW_BIT).unwrap_or(false);
+    if is_root || (has_admin && has_raw) {
+        return Ok(());
+    }
+    bail!(
+        "当前权限不足：需要 root 或 CAP_NET_ADMIN + CAP_NET_RAW。请使用 sudo 执行，例如 `sudo clash tun on`"
+    );
+}
+
+fn has_capability_bit(bit: u32) -> Result<bool> {
+    let mask = read_cap_eff()?;
+    Ok((mask & (1u64 << bit)) != 0)
+}
+
+fn is_root_user() -> Result<bool> {
+    let output = Command::new("id")
+        .arg("-u")
+        .output()
+        .context("执行 `id -u` 失败")?;
+    if !output.status.success() {
+        bail!("`id -u` 返回非成功状态: {}", output.status);
+    }
+    let uid = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    Ok(uid == "0")
 }
 
 fn key_value<'a>(root: &'a Value, key: &str) -> Option<&'a Value> {

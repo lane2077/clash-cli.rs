@@ -1,5 +1,6 @@
 use std::fs;
 use std::path::Path;
+use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, bail};
@@ -138,15 +139,51 @@ fn cmd_use(args: ProfileUseArgs) -> Result<()> {
     index.active = Some(args.name.clone());
     save_index(&paths.profile_index_file, &index)?;
 
+    let apply = args.apply || args.fetch;
+    if args.fetch {
+        cmd_fetch(ProfileFetchArgs {
+            name: args.name.clone(),
+            force: true,
+        })?;
+    }
+    if apply {
+        cmd_render(ProfileRenderArgs {
+            name: Some(args.name.clone()),
+            output: None,
+            no_mixin: false,
+            follow_subscription_port: false,
+        })?;
+        if !args.no_restart {
+            restart_system_service(&args.service_name)?;
+        }
+    }
+
     if is_json_mode() {
         return print_json(&serde_json::json!({
             "ok": true,
             "action": "profile.use",
             "active": index.active,
+            "applied": apply,
+            "fetched": args.fetch,
+            "restarted": apply && !args.no_restart,
+            "service": normalize_unit_name(&args.service_name),
         }));
     }
 
     println!("当前 profile 已切换为: {}", args.name);
+    if apply {
+        println!("已渲染到运行配置。");
+        if args.no_restart {
+            println!("已跳过服务重启（--no-restart）。");
+        } else {
+            println!("已重启服务: {}", normalize_unit_name(&args.service_name));
+        }
+    } else {
+        println!(
+            "提示: 仅切换了 active profile；如需立即生效请执行 `clash profile use --name {} --apply`",
+            args.name
+        );
+    }
     Ok(())
 }
 
@@ -472,6 +509,35 @@ fn now_unix() -> u64 {
         .duration_since(UNIX_EPOCH)
         .map(|v| v.as_secs())
         .unwrap_or(0)
+}
+
+fn normalize_unit_name(name: &str) -> String {
+    if name.ends_with(".service") {
+        name.to_string()
+    } else {
+        format!("{name}.service")
+    }
+}
+
+fn restart_system_service(name: &str) -> Result<()> {
+    let unit = normalize_unit_name(name);
+    let output = Command::new("systemctl")
+        .arg("restart")
+        .arg(&unit)
+        .output()
+        .with_context(|| format!("执行 systemctl restart 失败: {unit}"))?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        bail!(
+            "已渲染配置，但重启 {} 失败: {} (stdout={}, stderr={})",
+            unit,
+            output.status,
+            stdout.trim(),
+            stderr.trim()
+        );
+    }
+    Ok(())
 }
 
 #[cfg(test)]

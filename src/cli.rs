@@ -187,6 +187,18 @@ pub struct ProfileAddArgs {
 pub struct ProfileUseArgs {
     #[arg(long, help = "profile 名称")]
     pub name: String,
+    #[arg(long, help = "切换后立即渲染到 runtime/config.yaml")]
+    pub apply: bool,
+    #[arg(long, help = "切换后强制拉取最新订阅（隐含 --apply）")]
+    pub fetch: bool,
+    #[arg(
+        long,
+        default_value = DEFAULT_SERVICE_NAME,
+        help = "apply 后联动重启的 systemd 服务名"
+    )]
+    pub service_name: String,
+    #[arg(long, help = "apply 后仅渲染，不自动重启服务")]
+    pub no_restart: bool,
 }
 
 #[derive(Args, Clone)]

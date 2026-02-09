@@ -123,6 +123,10 @@ fn ensure_profile_ready(name: &str, url: &str) -> Result<()> {
                 }))?;
                 profile::run(ProfileCommand::Use(ProfileUseArgs {
                     name: name.to_string(),
+                    apply: false,
+                    fetch: false,
+                    service_name: "clash-mihomo".to_string(),
+                    no_restart: true,
                 }))?;
                 return Ok(());
             }
