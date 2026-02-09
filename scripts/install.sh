@@ -120,9 +120,14 @@ fi
 case "$(uname -m)" in
   x86_64|amd64)
     ASSET="clash-linux-amd64.tar.gz"
+    BIN_NAME="clash-linux-amd64"
+    ;;
+  aarch64|arm64)
+    ASSET="clash-linux-arm64.tar.gz"
+    BIN_NAME="clash-linux-arm64"
     ;;
   *)
-    echo "当前仅提供 Linux amd64 发布包，当前架构: $(uname -m)" >&2
+    echo "当前仅提供 Linux amd64/arm64 发布包，当前架构: $(uname -m)" >&2
     exit 1
     ;;
 esac
@@ -193,13 +198,13 @@ if [[ -z "${DOWNLOADED_URL}" ]]; then
 fi
 
 tar -xzf "${ARCHIVE_PATH}" -C "${TMP_DIR}"
-if [[ ! -f "${TMP_DIR}/clash-linux-amd64" ]]; then
-  echo "发布包内容异常：未找到 clash-linux-amd64" >&2
+if [[ ! -f "${TMP_DIR}/${BIN_NAME}" ]]; then
+  echo "发布包内容异常：未找到 ${BIN_NAME}" >&2
   exit 1
 fi
 
 echo "安装 clash 到 ${CLASH_BIN_PATH} ..."
-${SUDO} install -m 0755 "${TMP_DIR}/clash-linux-amd64" "${CLASH_BIN_PATH}"
+${SUDO} install -m 0755 "${TMP_DIR}/${BIN_NAME}" "${CLASH_BIN_PATH}"
 echo "下载来源: ${DOWNLOADED_URL}"
 
 if [[ "${SKIP_SETUP}" -eq 1 ]]; then

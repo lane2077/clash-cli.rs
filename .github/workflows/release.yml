@@ -9,8 +9,21 @@ permissions:
   contents: write
 
 jobs:
-  build-linux-amd64:
-    runs-on: ubuntu-latest
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            bin_name: clash-linux-amd64
+            archive_name: clash-linux-amd64.tar.gz
+          - runner: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+            bin_name: clash-linux-arm64
+            archive_name: clash-linux-arm64.tar.gz
+
+    runs-on: ${{ matrix.runner }}
 
     steps:
       - name: 检出代码
@@ -18,24 +31,54 @@ jobs:
 
       - name: 安装 Rust
         uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
 
       - name: 缓存 Cargo
         uses: Swatinem/rust-cache@v2
 
-      - name: 构建二进制
-        run: cargo build --release
+      - name: 构建二进制（${{ matrix.target }}）
+        run: cargo build --release --target "${{ matrix.target }}"
 
-      - name: 打包发布文件
+      - name: 打包发布文件（${{ matrix.bin_name }}）
         run: |
           mkdir -p dist
-          cp target/release/clash dist/clash-linux-amd64
-          chmod +x dist/clash-linux-amd64
-          tar -C dist -czf clash-linux-amd64.tar.gz clash-linux-amd64
+          cp "target/${{ matrix.target }}/release/clash" "dist/${{ matrix.bin_name }}"
+          chmod +x "dist/${{ matrix.bin_name }}"
+          tar -C dist -czf "${{ matrix.archive_name }}" "${{ matrix.bin_name }}"
+
+      - name: 上传发布物（artifact）
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.archive_name }}
+          path: ${{ matrix.archive_name }}
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+
+      - name: 下载所有构建产物
+        uses: actions/download-artifact@v4
+        with:
+          path: release-assets
+
+      - name: 整理发布目录
+        run: |
+          mkdir -p dist
+          find release-assets -type f -name "*.tar.gz" -exec cp {} dist/ \;
+          cp scripts/install.sh dist/install.sh
+          cp scripts/uninstall.sh dist/uninstall.sh
+          (cd dist && sha256sum *.tar.gz > SHA256SUMS.txt)
 
       - name: 发布到 GitHub Release
         uses: softprops/action-gh-release@v2
         with:
           files: |
-            clash-linux-amd64.tar.gz
-            scripts/install.sh
-            scripts/uninstall.sh
+            dist/*.tar.gz
+            dist/install.sh
+            dist/uninstall.sh
+            dist/SHA256SUMS.txt
