@@ -1,0 +1,6 @@
+/target
+/.home
+/.tmpcfg
+/runtime
+.DS_Store
+docs/

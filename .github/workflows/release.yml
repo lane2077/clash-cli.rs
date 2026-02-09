@@ -1,0 +1,41 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  build-linux-amd64:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+
+      - name: 安装 Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: 缓存 Cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: 构建二进制
+        run: cargo build --release
+
+      - name: 打包发布文件
+        run: |
+          mkdir -p dist
+          cp target/release/clash dist/clash-linux-amd64
+          chmod +x dist/clash-linux-amd64
+          tar -C dist -czf clash-linux-amd64.tar.gz clash-linux-amd64
+
+      - name: 发布到 GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            clash-linux-amd64.tar.gz
+            scripts/install.sh
+            scripts/uninstall.sh
