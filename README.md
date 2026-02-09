@@ -29,7 +29,7 @@ curl -fsSL https://raw.githubusercontent.com/lane2077/clash-cli.rs/main/scripts/
 如果你网络访问 GitHub 不稳定，可指定镜像：
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/lane2077/clash-cli.rs/main/scripts/install.sh | bash -s -- \
+curl -fsSL https://ghfast.top/https://raw.githubusercontent.com/lane2077/clash-cli.rs/main/scripts/install.sh | bash -s -- \
   --mirror ghfast \
   --profile-url "https://example.com/sub.yaml"
 ```
@@ -61,4 +61,10 @@ eval "$(clash proxy env on)"
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/lane2077/clash-cli.rs/main/scripts/uninstall.sh | bash
+```
+
+如果 `raw.githubusercontent.com` 不稳定，也可走镜像：
+
+```bash
+curl -fsSL https://ghfast.top/https://raw.githubusercontent.com/lane2077/clash-cli.rs/main/scripts/uninstall.sh | bash
 ```
