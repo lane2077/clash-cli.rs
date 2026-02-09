@@ -1,5 +1,6 @@
 use std::env;
 use std::fs;
+use std::io::IsTerminal;
 use std::path::Path;
 use std::process::{Command, Stdio};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -238,7 +239,9 @@ fn cmd_doctor() -> Result<()> {
 
 fn cmd_on(args: TunApplyArgs) -> Result<()> {
     ensure_linux_host()?;
-    ensure_tun_privileges()?;
+    if ensure_tun_privileges_or_delegate(TunAction::On, &args)? == PrivilegeCheck::Delegated {
+        return Ok(());
+    }
     let json_mode = is_json_mode();
 
     if !Path::new("/dev/net/tun").exists() {
@@ -348,7 +351,9 @@ fn cmd_on(args: TunApplyArgs) -> Result<()> {
 
 fn cmd_off(args: TunApplyArgs) -> Result<()> {
     ensure_linux_host()?;
-    ensure_tun_privileges()?;
+    if ensure_tun_privileges_or_delegate(TunAction::Off, &args)? == PrivilegeCheck::Delegated {
+        return Ok(());
+    }
     let json_mode = is_json_mode();
     let paths = app_paths()?;
     let mut root = load_or_init_config(&paths.runtime_config_file)?;
@@ -1235,6 +1240,97 @@ fn ensure_tun_privileges() -> Result<()> {
     bail!(
         "当前权限不足：需要 root 或 CAP_NET_ADMIN + CAP_NET_RAW。请使用 sudo 执行，例如 `sudo clash tun on`"
     );
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum TunAction {
+    On,
+    Off,
+}
+
+impl TunAction {
+    fn as_cli_str(self) -> &'static str {
+        match self {
+            TunAction::On => "on",
+            TunAction::Off => "off",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PrivilegeCheck {
+    Ok,
+    Delegated,
+}
+
+fn ensure_tun_privileges_or_delegate(action: TunAction, args: &TunApplyArgs) -> Result<PrivilegeCheck> {
+    if ensure_tun_privileges().is_ok() {
+        return Ok(PrivilegeCheck::Ok);
+    }
+
+    if !should_auto_delegate_to_sudo() {
+        ensure_tun_privileges()?;
+        return Ok(PrivilegeCheck::Ok);
+    }
+
+    if !is_json_mode() {
+        println!(
+            "检测到权限不足，正在请求 sudo 授权继续执行 `clash tun {}` ...",
+            action.as_cli_str()
+        );
+    }
+
+    let status = run_tun_with_sudo(action, args).context("调用 sudo 执行 tun 命令失败")?;
+    if status.success() {
+        return Ok(PrivilegeCheck::Delegated);
+    }
+
+    bail!(
+        "sudo 授权未通过或命令执行失败，请手动执行: sudo clash tun {}",
+        action.as_cli_str()
+    );
+}
+
+fn should_auto_delegate_to_sudo() -> bool {
+    if is_json_mode() {
+        return false;
+    }
+    if env::var_os("CLASH_CLI_NO_AUTO_SUDO").is_some() {
+        return false;
+    }
+    if env::var("CLASH_CLI_SUDO_REEXEC").ok().as_deref() == Some("1") {
+        return false;
+    }
+    if !std::io::stdin().is_terminal() || !std::io::stderr().is_terminal() {
+        return false;
+    }
+    command_exists("sudo")
+}
+
+fn run_tun_with_sudo(action: TunAction, args: &TunApplyArgs) -> Result<std::process::ExitStatus> {
+    let exe = std::env::current_exe().context("获取当前可执行文件路径失败")?;
+    let mut cmd = Command::new("sudo");
+    cmd.arg("env");
+    cmd.arg("CLASH_CLI_SUDO_REEXEC=1");
+    if let Some(home) = env::var_os("CLASH_CLI_HOME") {
+        cmd.arg(format!("CLASH_CLI_HOME={}", home.to_string_lossy()));
+    }
+    cmd.arg(exe);
+    if is_json_mode() {
+        cmd.arg("--json");
+    }
+    cmd.arg("tun");
+    cmd.arg(action.as_cli_str());
+    cmd.arg("--name");
+    cmd.arg(&args.name);
+    if args.user {
+        cmd.arg("--user");
+    }
+    if args.no_restart {
+        cmd.arg("--no-restart");
+    }
+    let status = cmd.status().context("启动 sudo 失败")?;
+    Ok(status)
 }
 
 fn has_capability_bit(bit: u32) -> Result<bool> {
