@@ -62,12 +62,3 @@ eval "$(clash proxy env on)"
 ```bash
 curl -fsSL https://raw.githubusercontent.com/lane2077/clash-cli.rs/main/scripts/uninstall.sh | bash
 ```
-
-## 发布新版本（维护者）
-
-推送语义化 tag 会自动触发 Release workflow，并上传多架构资产：
-
-```bash
-git tag v0.1.0
-git push origin v0.1.0
-```
