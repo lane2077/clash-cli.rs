@@ -419,6 +419,8 @@ pub struct SetupUnifyArgs {
     pub service_name: String,
     #[arg(long, help = "仅收敛 profile，不渲染与重启服务")]
     pub no_apply: bool,
+    #[arg(long, help = "仅合并 profile，不替换历史目录为 /etc/clash-cli 软链接")]
+    pub no_link: bool,
 }
 
 #[derive(Args, Clone)]

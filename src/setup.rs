@@ -1,9 +1,11 @@
 use std::env;
+use std::ffi::OsString;
 use std::fs;
 use std::io::IsTerminal;
-use std::os::unix::fs::PermissionsExt;
+use std::os::unix::fs::{PermissionsExt, symlink};
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
@@ -140,6 +142,13 @@ struct UnifyStats {
     missing_files: usize,
 }
 
+#[derive(Default)]
+struct LinkStats {
+    linked: usize,
+    already_linked: usize,
+    failed: usize,
+}
+
 fn cmd_unify(args: SetupUnifyArgs) -> Result<()> {
     ensure_linux_host()?;
     if ensure_setup_privileges_or_delegate(SetupAction::Unify(&args))? == PrivilegeCheck::Delegated
@@ -166,7 +175,7 @@ fn cmd_unify(args: SetupUnifyArgs) -> Result<()> {
         println!("未发现可合并的历史配置目录。");
     }
 
-    for src_dir in source_dirs {
+    for src_dir in &source_dirs {
         let src_profile_dir = src_dir.join("profiles");
         let src_index_file = src_profile_dir.join("index.json");
         if !src_index_file.exists() {
@@ -211,6 +220,15 @@ fn cmd_unify(args: SetupUnifyArgs) -> Result<()> {
         "收敛完成: imported={}, existed={}, conflicts={}, missing_files={}",
         stats.imported, stats.existed, stats.conflicts, stats.missing_files
     );
+    if args.no_link {
+        println!("已按请求跳过目录软链接替换（--no-link）。");
+    } else {
+        let link_stats = link_source_dirs_to_system(&source_dirs, &paths.config_dir, &mut warnings);
+        println!(
+            "目录收敛: linked={}, already_linked={}, failed={}",
+            link_stats.linked, link_stats.already_linked, link_stats.failed
+        );
+    }
     if let Some(active) = index.active.as_deref() {
         println!("当前 active profile: {}", active);
     }
@@ -444,6 +462,9 @@ fn append_setup_unify_args(cmd: &mut Command, args: &SetupUnifyArgs) {
     if args.no_apply {
         cmd.arg("--no-apply");
     }
+    if args.no_link {
+        cmd.arg("--no-link");
+    }
 }
 
 fn mirror_source_str(v: MirrorSource) -> &'static str {
@@ -589,4 +610,96 @@ fn merge_profile_entry(
     index.profiles.push(imported);
     stats.imported += 1;
     Ok(())
+}
+
+fn link_source_dirs_to_system(
+    source_dirs: &[PathBuf],
+    dest_dir: &Path,
+    warnings: &mut Vec<String>,
+) -> LinkStats {
+    let mut stats = LinkStats::default();
+    for src_dir in source_dirs {
+        let meta = match fs::symlink_metadata(src_dir) {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+
+        if meta.file_type().is_symlink() {
+            match fs::read_link(src_dir) {
+                Ok(target) => {
+                    if path_eq(&target, dest_dir) {
+                        stats.already_linked += 1;
+                        continue;
+                    }
+                }
+                Err(err) => {
+                    warnings.push(format!(
+                        "读取软链接目标失败，准备重建: {} ({err})",
+                        src_dir.display()
+                    ));
+                }
+            }
+        }
+
+        let backup = build_backup_path(src_dir);
+        if let Err(err) = fs::rename(src_dir, &backup) {
+            warnings.push(format!(
+                "目录替换失败（无法备份），已跳过: {} -> {} ({err})",
+                src_dir.display(),
+                backup.display()
+            ));
+            stats.failed += 1;
+            continue;
+        }
+
+        if let Err(err) = symlink(dest_dir, src_dir) {
+            let _ = fs::rename(&backup, src_dir);
+            warnings.push(format!(
+                "创建软链接失败，已回滚: {} -> {} ({err})",
+                src_dir.display(),
+                dest_dir.display()
+            ));
+            stats.failed += 1;
+            continue;
+        }
+        stats.linked += 1;
+    }
+    stats
+}
+
+fn build_backup_path(path: &Path) -> PathBuf {
+    let parent = path.parent().unwrap_or(Path::new("/"));
+    let base_name = path.file_name().unwrap_or_else(|| std::ffi::OsStr::new("clash-cli"));
+    let ts = now_unix();
+    let mut idx: u32 = 0;
+    loop {
+        let mut name = OsString::from(base_name);
+        if idx == 0 {
+            name.push(format!(".bak.{ts}"));
+        } else {
+            name.push(format!(".bak.{ts}.{idx}"));
+        }
+        let candidate = parent.join(name);
+        if !candidate.exists() {
+            return candidate;
+        }
+        idx = idx.saturating_add(1);
+    }
+}
+
+fn path_eq(a: &Path, b: &Path) -> bool {
+    if a == b {
+        return true;
+    }
+    match (fs::canonicalize(a), fs::canonicalize(b)) {
+        (Ok(x), Ok(y)) => x == y,
+        _ => false,
+    }
+}
+
+fn now_unix() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|v| v.as_secs())
+        .unwrap_or(0)
 }
