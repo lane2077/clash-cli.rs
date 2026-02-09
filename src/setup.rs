@@ -19,6 +19,8 @@ use crate::profile;
 use crate::service;
 use crate::tun;
 
+const DEFAULT_SYSTEM_HOME: &str = "/etc/clash-cli";
+
 pub fn run(command: SetupCommand) -> Result<()> {
     match command {
         SetupCommand::Init(args) => cmd_init(args),
@@ -34,6 +36,8 @@ fn cmd_init(args: SetupInitArgs) -> Result<()> {
     if args.profile_url.trim().is_empty() {
         bail!("`--profile-url` 不能为空");
     }
+
+    ensure_setup_home_for_root();
 
     println!("开始执行一键初始化...");
 
@@ -190,4 +194,17 @@ fn ensure_root_user() -> Result<()> {
         );
     }
     Ok(())
+}
+
+fn ensure_setup_home_for_root() {
+    if env::var_os("CLASH_CLI_HOME").is_none() {
+        // 仅在命令主流程早期设置一次，后续同进程不会并发修改环境变量。
+        unsafe {
+            env::set_var("CLASH_CLI_HOME", DEFAULT_SYSTEM_HOME);
+        }
+        println!(
+            "未设置 CLASH_CLI_HOME，setup init 默认使用系统目录: {}",
+            DEFAULT_SYSTEM_HOME
+        );
+    }
 }

@@ -1,5 +1,5 @@
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -131,6 +131,12 @@ fn cmd_list() -> Result<()> {
 
 fn cmd_use(args: ProfileUseArgs) -> Result<()> {
     let paths = app_paths()?;
+    let apply = args.apply || args.fetch;
+
+    if apply && !args.no_restart {
+        ensure_service_runtime_home_matches_current(&args.service_name, &paths.runtime_config_file)?;
+    }
+
     let mut index = load_index(&paths.profile_index_file)?;
 
     if !index.profiles.iter().any(|p| p.name == args.name) {
@@ -139,7 +145,6 @@ fn cmd_use(args: ProfileUseArgs) -> Result<()> {
     index.active = Some(args.name.clone());
     save_index(&paths.profile_index_file, &index)?;
 
-    let apply = args.apply || args.fetch;
     if args.fetch {
         cmd_fetch(ProfileFetchArgs {
             name: args.name.clone(),
@@ -538,6 +543,110 @@ fn restart_system_service(name: &str) -> Result<()> {
         );
     }
     Ok(())
+}
+
+fn ensure_service_runtime_home_matches_current(
+    service_name: &str,
+    current_runtime_config: &Path,
+) -> Result<()> {
+    let unit = normalize_unit_name(service_name);
+    let Some(service_runtime_config) = detect_service_runtime_config_path(&unit)? else {
+        return Ok(());
+    };
+
+    if path_eq(&service_runtime_config, current_runtime_config) {
+        return Ok(());
+    }
+
+    let service_home = infer_home_from_runtime_config(&service_runtime_config);
+    let current_home = infer_home_from_runtime_config(current_runtime_config);
+
+    let mut message = format!(
+        "检测到服务 {} 使用配置: {}\n当前命令使用配置: {}",
+        unit,
+        service_runtime_config.display(),
+        current_runtime_config.display()
+    );
+    message.push_str("\n这会导致「profile 切换看似成功，但 Dashboard 仍显示旧配置」。");
+
+    if let Some(home) = service_home {
+        message.push_str(&format!(
+            "\n请改用同一目录执行，例如:\n  sudo env CLASH_CLI_HOME={} clash profile use --name <profile> --fetch --apply --service-name {}",
+            home.display(),
+            trim_service_suffix(service_name)
+        ));
+    } else if let Some(home) = current_home {
+        message.push_str(&format!(
+            "\n当前目录来源: {}。请保证 service -f 与该目录一致，或改用 service 对应目录执行。",
+            home.display()
+        ));
+    } else {
+        message.push_str("\n请保证 service 的 -f 路径与 CLASH_CLI_HOME/runtime/config.yaml 指向同一份配置。");
+    }
+
+    bail!("配置目录不一致，已阻止继续执行。\n{message}");
+}
+
+fn detect_service_runtime_config_path(unit: &str) -> Result<Option<PathBuf>> {
+    let output = Command::new("systemctl")
+        .arg("show")
+        .arg("-p")
+        .arg("ExecStart")
+        .arg("--value")
+        .arg(unit)
+        .output()
+        .with_context(|| format!("读取 service ExecStart 失败: {unit}"))?;
+
+    if !output.status.success() {
+        return Ok(None);
+    }
+
+    let exec = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if exec.is_empty() {
+        return Ok(None);
+    }
+
+    let mut prev_is_f = false;
+    for token in exec.split_whitespace() {
+        let cleaned = token
+            .trim_matches(|c| c == '"' || c == '\'')
+            .trim_end_matches(';')
+            .trim_end_matches(',');
+        if cleaned.is_empty() {
+            continue;
+        }
+        if prev_is_f {
+            return Ok(Some(PathBuf::from(cleaned)));
+        }
+        prev_is_f = cleaned == "-f";
+    }
+
+    Ok(None)
+}
+
+fn path_eq(a: &Path, b: &Path) -> bool {
+    if a == b {
+        return true;
+    }
+    match (fs::canonicalize(a), fs::canonicalize(b)) {
+        (Ok(left), Ok(right)) => left == right,
+        _ => false,
+    }
+}
+
+fn infer_home_from_runtime_config(path: &Path) -> Option<PathBuf> {
+    if path.file_name()?.to_str()? != "config.yaml" {
+        return None;
+    }
+    let runtime_dir = path.parent()?;
+    if runtime_dir.file_name()?.to_str()? != "runtime" {
+        return None;
+    }
+    runtime_dir.parent().map(|p| p.to_path_buf())
+}
+
+fn trim_service_suffix(name: &str) -> &str {
+    name.strip_suffix(".service").unwrap_or(name)
 }
 
 #[cfg(test)]
