@@ -246,18 +246,15 @@ fn cmd_unify(args: SetupUnifyArgs) -> Result<()> {
         .active
         .clone()
         .context("收敛后没有可用 active profile，无法 apply")?;
-    profile::run(ProfileCommand::Render(ProfileRenderArgs {
-        name: Some(active),
-        output: None,
-        no_mixin: false,
-        follow_subscription_port: false,
-    }))?;
-    service::run(ServiceCommand::Restart(ServiceTargetArgs {
-        name: args.service_name.clone(),
-        user: false,
+    profile::run(ProfileCommand::Use(ProfileUseArgs {
+        name: active,
+        apply: true,
+        fetch: true,
+        service_name: args.service_name.clone(),
+        no_restart: false,
     }))?;
     println!(
-        "已渲染并重启服务: {}.service",
+        "已拉取最新订阅并渲染重启服务: {}.service",
         trim_service_suffix(&args.service_name)
     );
     Ok(())
