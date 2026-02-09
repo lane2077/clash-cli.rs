@@ -1,4 +1,6 @@
+use std::env;
 use std::fs;
+use std::io::{ErrorKind, IsTerminal};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -39,9 +41,11 @@ const DEFAULT_LOCAL_EXTERNAL_UI_NAME: &str = "metacubexd";
 const DEFAULT_LOCAL_EXTERNAL_UI_URL: &str =
     "https://ghfast.top/https://github.com/MetaCubeX/metacubexd/archive/refs/heads/gh-pages.zip";
 const DEFAULT_SYSTEM_SERVICE_NAME: &str = "clash-mihomo.service";
+const AUTO_SUDO_ENV: &str = "CLASH_CLI_SUDO_REEXEC";
 
 pub fn run(command: ProfileCommand) -> Result<()> {
-    match command {
+    let retry_command = command.clone();
+    let result = match command {
         ProfileCommand::Add(args) => cmd_add(args),
         ProfileCommand::List => cmd_list(),
         ProfileCommand::Use(args) => cmd_use(args),
@@ -49,6 +53,19 @@ pub fn run(command: ProfileCommand) -> Result<()> {
         ProfileCommand::Remove(args) => cmd_remove(args),
         ProfileCommand::Render(args) => cmd_render(args),
         ProfileCommand::Validate(args) => cmd_validate(args),
+    };
+
+    match result {
+        Ok(()) => Ok(()),
+        Err(err) => {
+            if should_retry_with_sudo(&retry_command, &err) {
+                if !is_json_mode() {
+                    println!("检测到权限不足，正在请求 sudo 授权继续执行 profile 命令...");
+                }
+                return run_profile_with_sudo(&retry_command);
+            }
+            Err(err)
+        }
     }
 }
 
@@ -674,6 +691,158 @@ fn print_profile_home_hint(paths: &AppPaths) {
             }
         }
     }
+}
+
+fn should_retry_with_sudo(command: &ProfileCommand, err: &anyhow::Error) -> bool {
+    if !profile_command_requires_write(command) {
+        return false;
+    }
+    if !is_permission_denied(err) {
+        return false;
+    }
+    if is_json_mode() {
+        return false;
+    }
+    if env::var_os("CLASH_CLI_NO_AUTO_SUDO").is_some() {
+        return false;
+    }
+    if env::var(AUTO_SUDO_ENV).ok().as_deref() == Some("1") {
+        return false;
+    }
+    if !std::io::stdin().is_terminal() || !std::io::stderr().is_terminal() {
+        return false;
+    }
+    command_exists("sudo")
+}
+
+fn profile_command_requires_write(command: &ProfileCommand) -> bool {
+    matches!(
+        command,
+        ProfileCommand::Add(_)
+            | ProfileCommand::Use(_)
+            | ProfileCommand::Fetch(_)
+            | ProfileCommand::Remove(_)
+            | ProfileCommand::Render(_)
+    )
+}
+
+fn is_permission_denied(err: &anyhow::Error) -> bool {
+    for cause in err.chain() {
+        if let Some(io_err) = cause.downcast_ref::<std::io::Error>() {
+            if io_err.kind() == ErrorKind::PermissionDenied {
+                return true;
+            }
+        }
+    }
+    let msg = err.to_string();
+    msg.contains("Permission denied")
+        || msg.contains("Operation not permitted")
+        || msg.contains("权限不足")
+        || msg.contains("权限不够")
+}
+
+fn run_profile_with_sudo(command: &ProfileCommand) -> Result<()> {
+    let exe = std::env::current_exe().context("获取当前可执行文件路径失败")?;
+    let mut cmd = Command::new("sudo");
+    cmd.arg("env");
+    cmd.arg(format!("{AUTO_SUDO_ENV}=1"));
+    if let Some(home) = env::var_os("CLASH_CLI_HOME") {
+        cmd.arg(format!("CLASH_CLI_HOME={}", home.to_string_lossy()));
+    }
+    cmd.arg(exe);
+    if is_json_mode() {
+        cmd.arg("--json");
+    }
+    cmd.args(profile_command_to_cli_args(command)?);
+    let status = cmd.status().context("启动 sudo 失败")?;
+    if status.success() {
+        return Ok(());
+    }
+    bail!("sudo 授权未通过或命令执行失败，请手动使用 sudo 重试");
+}
+
+fn profile_command_to_cli_args(command: &ProfileCommand) -> Result<Vec<String>> {
+    let mut args = vec!["profile".to_string()];
+    match command {
+        ProfileCommand::Add(v) => {
+            args.push("add".to_string());
+            args.push("--name".to_string());
+            args.push(v.name.clone());
+            args.push("--url".to_string());
+            args.push(v.url.clone());
+            if v.use_profile {
+                args.push("--use-profile".to_string());
+            }
+            if v.no_fetch {
+                args.push("--no-fetch".to_string());
+            }
+        }
+        ProfileCommand::List => {
+            args.push("list".to_string());
+        }
+        ProfileCommand::Use(v) => {
+            args.push("use".to_string());
+            args.push("--name".to_string());
+            args.push(v.name.clone());
+            if v.apply {
+                args.push("--apply".to_string());
+            }
+            if v.fetch {
+                args.push("--fetch".to_string());
+            }
+            args.push("--service-name".to_string());
+            args.push(v.service_name.clone());
+            if v.no_restart {
+                args.push("--no-restart".to_string());
+            }
+        }
+        ProfileCommand::Fetch(v) => {
+            args.push("fetch".to_string());
+            args.push("--name".to_string());
+            args.push(v.name.clone());
+            if v.force {
+                args.push("--force".to_string());
+            }
+        }
+        ProfileCommand::Remove(v) => {
+            args.push("remove".to_string());
+            args.push("--name".to_string());
+            args.push(v.name.clone());
+        }
+        ProfileCommand::Render(v) => {
+            args.push("render".to_string());
+            if let Some(name) = &v.name {
+                args.push("--name".to_string());
+                args.push(name.clone());
+            }
+            if let Some(output) = &v.output {
+                args.push("--output".to_string());
+                args.push(output.display().to_string());
+            }
+            if v.no_mixin {
+                args.push("--no-mixin".to_string());
+            }
+            if v.follow_subscription_port {
+                args.push("--follow-subscription-port".to_string());
+            }
+        }
+        ProfileCommand::Validate(v) => {
+            args.push("validate".to_string());
+            if let Some(name) = &v.name {
+                args.push("--name".to_string());
+                args.push(name.clone());
+            }
+        }
+    }
+    Ok(args)
+}
+
+fn command_exists(binary: &str) -> bool {
+    Command::new(binary)
+        .arg("--version")
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false)
 }
 
 #[cfg(test)]

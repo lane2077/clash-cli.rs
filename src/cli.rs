@@ -120,7 +120,7 @@ pub enum TunCommand {
     Status(TunStatusArgs),
 }
 
-#[derive(Subcommand)]
+#[derive(Subcommand, Clone)]
 pub enum ProfileCommand {
     #[command(about = "添加订阅 profile")]
     Add(ProfileAddArgs),
