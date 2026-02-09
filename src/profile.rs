@@ -13,7 +13,7 @@ use crate::cli::{
     ProfileUseArgs, ProfileValidateArgs,
 };
 use crate::output::{is_json_mode, print_json};
-use crate::paths::app_paths;
+use crate::paths::{AppPaths, app_paths};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct ProfileEntry {
@@ -38,6 +38,7 @@ const DEFAULT_LOCAL_EXTERNAL_UI: &str = "ui";
 const DEFAULT_LOCAL_EXTERNAL_UI_NAME: &str = "metacubexd";
 const DEFAULT_LOCAL_EXTERNAL_UI_URL: &str =
     "https://ghfast.top/https://github.com/MetaCubeX/metacubexd/archive/refs/heads/gh-pages.zip";
+const DEFAULT_SYSTEM_SERVICE_NAME: &str = "clash-mihomo.service";
 
 pub fn run(command: ProfileCommand) -> Result<()> {
     match command {
@@ -105,10 +106,12 @@ fn cmd_list() -> Result<()> {
     }
 
     if index.profiles.is_empty() {
+        print_profile_home_hint(&paths);
         println!("暂无 profile。可执行 `clash profile add --name xxx --url ...`");
         return Ok(());
     }
 
+    print_profile_home_hint(&paths);
     for profile in index.profiles {
         let mark = if index.active.as_deref() == Some(profile.name.as_str()) {
             "*"
@@ -647,6 +650,30 @@ fn infer_home_from_runtime_config(path: &Path) -> Option<PathBuf> {
 
 fn trim_service_suffix(name: &str) -> &str {
     name.strip_suffix(".service").unwrap_or(name)
+}
+
+fn print_profile_home_hint(paths: &AppPaths) {
+    if is_json_mode() {
+        return;
+    }
+    println!("当前配置目录: {}", paths.config_dir.display());
+    if let Ok(Some(service_runtime_config)) =
+        detect_service_runtime_config_path(DEFAULT_SYSTEM_SERVICE_NAME)
+    {
+        if !path_eq(&service_runtime_config, &paths.runtime_config_file) {
+            println!(
+                "提示: {} 当前使用配置: {}",
+                DEFAULT_SYSTEM_SERVICE_NAME,
+                service_runtime_config.display()
+            );
+            if let Some(home) = infer_home_from_runtime_config(&service_runtime_config) {
+                println!(
+                    "如需管理该服务，请使用: sudo env CLASH_CLI_HOME={} clash profile list",
+                    home.display()
+                );
+            }
+        }
+    }
 }
 
 #[cfg(test)]
