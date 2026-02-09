@@ -1,6 +1,5 @@
 use std::env;
 use std::fs;
-use std::io::IsTerminal;
 use std::path::Path;
 use std::process::{Command, Stdio};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -8,6 +7,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use anyhow::{Context, Result, bail};
 use serde_yaml::{Mapping, Number, Value};
 
+use crate::auto_sudo;
 use crate::cli::{TunApplyArgs, TunCommand, TunStatusArgs};
 use crate::output::{is_json_mode, print_json};
 use crate::paths::app_paths;
@@ -1273,7 +1273,7 @@ fn ensure_tun_privileges_or_delegate(action: TunAction, args: &TunApplyArgs) -> 
         return Ok(PrivilegeCheck::Ok);
     }
 
-    if !should_auto_delegate_to_sudo() {
+    if !auto_sudo::should_auto_delegate(is_json_mode()) {
         ensure_tun_privileges()?;
         return Ok(PrivilegeCheck::Ok);
     }
@@ -1301,7 +1301,7 @@ fn ensure_tun_doctor_privileges_or_delegate() -> Result<PrivilegeCheck> {
         return Ok(PrivilegeCheck::Ok);
     }
 
-    if !should_auto_delegate_to_sudo() {
+    if !auto_sudo::should_auto_delegate(is_json_mode()) {
         return Ok(PrivilegeCheck::Ok);
     }
 
@@ -1316,58 +1316,27 @@ fn ensure_tun_doctor_privileges_or_delegate() -> Result<PrivilegeCheck> {
     bail!("sudo 授权未通过或命令执行失败，请手动执行: sudo clash tun doctor");
 }
 
-fn should_auto_delegate_to_sudo() -> bool {
-    if is_json_mode() {
-        return false;
-    }
-    if env::var_os("CLASH_CLI_NO_AUTO_SUDO").is_some() {
-        return false;
-    }
-    if env::var("CLASH_CLI_SUDO_REEXEC").ok().as_deref() == Some("1") {
-        return false;
-    }
-    if !std::io::stdin().is_terminal() || !std::io::stderr().is_terminal() {
-        return false;
-    }
-    command_exists("sudo")
-}
-
-fn build_sudo_reexec_command() -> Result<Command> {
-    let exe = std::env::current_exe().context("获取当前可执行文件路径失败")?;
-    let mut cmd = Command::new("sudo");
-    cmd.arg("env");
-    cmd.arg("CLASH_CLI_SUDO_REEXEC=1");
-    if let Some(home) = env::var_os("CLASH_CLI_HOME") {
-        cmd.arg(format!("CLASH_CLI_HOME={}", home.to_string_lossy()));
-    }
-    cmd.arg(exe);
-    if is_json_mode() {
-        cmd.arg("--json");
-    }
-    Ok(cmd)
-}
-
 fn run_tun_apply_with_sudo(action: TunAction, args: &TunApplyArgs) -> Result<std::process::ExitStatus> {
-    let mut cmd = build_sudo_reexec_command()?;
-    cmd.arg("tun");
-    cmd.arg(action.as_cli_str());
-    cmd.arg("--name");
-    cmd.arg(&args.name);
-    if args.user {
-        cmd.arg("--user");
-    }
-    if args.no_restart {
-        cmd.arg("--no-restart");
-    }
-    let status = cmd.status().context("启动 sudo 失败")?;
-    Ok(status)
+    auto_sudo::run_with_sudo(is_json_mode(), |cmd| {
+        cmd.arg("tun");
+        cmd.arg(action.as_cli_str());
+        cmd.arg("--name");
+        cmd.arg(&args.name);
+        if args.user {
+            cmd.arg("--user");
+        }
+        if args.no_restart {
+            cmd.arg("--no-restart");
+        }
+        Ok(())
+    })
 }
 
 fn run_tun_doctor_with_sudo() -> Result<std::process::ExitStatus> {
-    let mut cmd = build_sudo_reexec_command()?;
-    cmd.arg("tun").arg(TunAction::Doctor.as_cli_str());
-    let status = cmd.status().context("启动 sudo 失败")?;
-    Ok(status)
+    auto_sudo::run_with_sudo(is_json_mode(), |cmd| {
+        cmd.arg("tun").arg(TunAction::Doctor.as_cli_str());
+        Ok(())
+    })
 }
 
 fn has_capability_bit(bit: u32) -> Result<bool> {

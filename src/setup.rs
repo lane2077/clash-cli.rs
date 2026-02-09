@@ -1,7 +1,6 @@
 use std::env;
 use std::ffi::OsString;
 use std::fs;
-use std::io::IsTerminal;
 use std::os::unix::fs::{PermissionsExt, symlink};
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -10,6 +9,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 
+use crate::auto_sudo;
 use crate::api;
 use crate::cli::{
     Amd64Variant, ApiCommand, ApiCommonArgs, CoreCommand, CoreInstallArgs, MirrorSource,
@@ -25,7 +25,6 @@ use crate::service;
 use crate::tun;
 
 const DEFAULT_SYSTEM_HOME: &str = "/etc/clash-cli";
-const AUTO_SUDO_ENV: &str = "CLASH_CLI_SUDO_REEXEC";
 
 pub fn run(command: SetupCommand) -> Result<()> {
     match command {
@@ -379,7 +378,7 @@ fn ensure_setup_privileges_or_delegate(action: SetupAction<'_>) -> Result<Privil
     if is_root_user().unwrap_or(false) {
         return Ok(PrivilegeCheck::Ok);
     }
-    if !should_auto_delegate_to_sudo() {
+    if !auto_sudo::should_auto_delegate(is_json_mode()) {
         return Ok(PrivilegeCheck::Ok);
     }
 
@@ -398,40 +397,15 @@ fn ensure_setup_privileges_or_delegate(action: SetupAction<'_>) -> Result<Privil
     bail!("sudo 授权未通过或命令执行失败，请手动使用 sudo 重试");
 }
 
-fn should_auto_delegate_to_sudo() -> bool {
-    if is_json_mode() {
-        return false;
-    }
-    if env::var_os("CLASH_CLI_NO_AUTO_SUDO").is_some() {
-        return false;
-    }
-    if env::var(AUTO_SUDO_ENV).ok().as_deref() == Some("1") {
-        return false;
-    }
-    if !std::io::stdin().is_terminal() || !std::io::stderr().is_terminal() {
-        return false;
-    }
-    command_exists("sudo")
-}
-
 fn run_setup_with_sudo(action: SetupAction<'_>) -> Result<std::process::ExitStatus> {
-    let exe = std::env::current_exe().context("获取当前可执行文件路径失败")?;
-    let mut cmd = Command::new("sudo");
-    cmd.arg("env");
-    cmd.arg(format!("{AUTO_SUDO_ENV}=1"));
-    if let Some(home) = env::var_os("CLASH_CLI_HOME") {
-        cmd.arg(format!("CLASH_CLI_HOME={}", home.to_string_lossy()));
-    }
-    cmd.arg(exe);
-    if is_json_mode() {
-        cmd.arg("--json");
-    }
-    cmd.arg("setup");
-    match action {
-        SetupAction::Init(args) => append_setup_init_args(&mut cmd, args),
-        SetupAction::Unify(args) => append_setup_unify_args(&mut cmd, args),
-    }
-    cmd.status().context("启动 sudo 失败")
+    auto_sudo::run_with_sudo(is_json_mode(), |cmd| {
+        cmd.arg("setup");
+        match action {
+            SetupAction::Init(args) => append_setup_init_args(cmd, args),
+            SetupAction::Unify(args) => append_setup_unify_args(cmd, args),
+        }
+        Ok(())
+    })
 }
 
 fn append_setup_init_args(cmd: &mut Command, args: &SetupInitArgs) {

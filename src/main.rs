@@ -1,4 +1,5 @@
 mod api;
+mod auto_sudo;
 mod cli;
 mod core;
 mod output;

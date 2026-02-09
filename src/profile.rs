@@ -1,6 +1,4 @@
-use std::env;
 use std::fs;
-use std::io::{ErrorKind, IsTerminal};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -10,6 +8,7 @@ use reqwest::blocking::Client;
 use serde::{Deserialize, Serialize};
 use serde_yaml::Value;
 
+use crate::auto_sudo;
 use crate::cli::{
     ProfileAddArgs, ProfileCommand, ProfileFetchArgs, ProfileRemoveArgs, ProfileRenderArgs,
     ProfileUseArgs, ProfileValidateArgs,
@@ -41,7 +40,6 @@ const DEFAULT_LOCAL_EXTERNAL_UI_NAME: &str = "metacubexd";
 const DEFAULT_LOCAL_EXTERNAL_UI_URL: &str =
     "https://ghfast.top/https://github.com/MetaCubeX/metacubexd/archive/refs/heads/gh-pages.zip";
 const DEFAULT_SYSTEM_SERVICE_NAME: &str = "clash-mihomo.service";
-const AUTO_SUDO_ENV: &str = "CLASH_CLI_SUDO_REEXEC";
 
 pub fn run(command: ProfileCommand) -> Result<()> {
     let retry_command = command.clone();
@@ -697,22 +695,10 @@ fn should_retry_with_sudo(command: &ProfileCommand, err: &anyhow::Error) -> bool
     if !profile_command_requires_write(command) {
         return false;
     }
-    if !is_permission_denied(err) {
+    if !auto_sudo::is_permission_denied_error(err) {
         return false;
     }
-    if is_json_mode() {
-        return false;
-    }
-    if env::var_os("CLASH_CLI_NO_AUTO_SUDO").is_some() {
-        return false;
-    }
-    if env::var(AUTO_SUDO_ENV).ok().as_deref() == Some("1") {
-        return false;
-    }
-    if !std::io::stdin().is_terminal() || !std::io::stderr().is_terminal() {
-        return false;
-    }
-    command_exists("sudo")
+    auto_sudo::should_auto_delegate(is_json_mode())
 }
 
 fn profile_command_requires_write(command: &ProfileCommand) -> bool {
@@ -726,35 +712,12 @@ fn profile_command_requires_write(command: &ProfileCommand) -> bool {
     )
 }
 
-fn is_permission_denied(err: &anyhow::Error) -> bool {
-    for cause in err.chain() {
-        if let Some(io_err) = cause.downcast_ref::<std::io::Error>() {
-            if io_err.kind() == ErrorKind::PermissionDenied {
-                return true;
-            }
-        }
-    }
-    let msg = err.to_string();
-    msg.contains("Permission denied")
-        || msg.contains("Operation not permitted")
-        || msg.contains("权限不足")
-        || msg.contains("权限不够")
-}
-
 fn run_profile_with_sudo(command: &ProfileCommand) -> Result<()> {
-    let exe = std::env::current_exe().context("获取当前可执行文件路径失败")?;
-    let mut cmd = Command::new("sudo");
-    cmd.arg("env");
-    cmd.arg(format!("{AUTO_SUDO_ENV}=1"));
-    if let Some(home) = env::var_os("CLASH_CLI_HOME") {
-        cmd.arg(format!("CLASH_CLI_HOME={}", home.to_string_lossy()));
-    }
-    cmd.arg(exe);
-    if is_json_mode() {
-        cmd.arg("--json");
-    }
-    cmd.args(profile_command_to_cli_args(command)?);
-    let status = cmd.status().context("启动 sudo 失败")?;
+    let cli_args = profile_command_to_cli_args(command)?;
+    let status = auto_sudo::run_with_sudo(is_json_mode(), |cmd| {
+        cmd.args(&cli_args);
+        Ok(())
+    })?;
     if status.success() {
         return Ok(());
     }
@@ -835,14 +798,6 @@ fn profile_command_to_cli_args(command: &ProfileCommand) -> Result<Vec<String>> 
         }
     }
     Ok(args)
-}
-
-fn command_exists(binary: &str) -> bool {
-    Command::new(binary)
-        .arg("--version")
-        .output()
-        .map(|o| o.status.success())
-        .unwrap_or(false)
 }
 
 #[cfg(test)]
