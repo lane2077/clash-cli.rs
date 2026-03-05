@@ -9,7 +9,10 @@
 - `service`：systemd 管理
 - `tun`：诊断/启停/状态
 - `profile`：订阅管理与渲染
+- `profile mixin`：mixin.yaml 覆盖规则管理
 - `api`：external-controller 查询与操作
+- `update`：CLI 自身版本更新
+- `ai`：AI 智能分析连接日志并优化路由规则
 
 ## 系统要求
 - Linux（systemd）
@@ -45,15 +48,40 @@ curl -fsSL https://raw.githubusercontent.com/lane2077/clash-cli.rs/main/scripts/
 sudo env CLASH_CLI_HOME=/etc/clash-cli clash setup init --profile-url "https://example.com/sub.yaml"
 ```
 
+## 更新 CLI
+
+```bash
+# v0.2.0+ 内置自更新
+clash update check           # 检查最新版本
+clash update run             # 下载并替换
+
+# 旧版本通过安装脚本升级
+curl -fsSL https://raw.githubusercontent.com/lane2077/clash-cli.rs/main/scripts/install.sh | bash -s -- --skip-setup
+```
+
 ## 常用命令
 
 ```bash
+# 基础
 clash --help
 clash setup init --help
-clash tun status --name clash-mihomo
-clash api ui-url
+
+# 代理与服务
 clash proxy start
 eval "$(clash proxy env on)"
+clash tun status --name clash-mihomo
+clash api ui-url
+
+# Mixin 规则管理
+clash profile mixin show
+clash profile mixin set --key tun.enable --value true
+clash profile mixin unset --key tun.enable
+clash profile mixin reset
+
+# AI 规则优化
+clash ai models --api-base https://your-api.com/v1
+clash ai rules --api-base https://your-api.com/v1 --model gpt-4o
+clash ai rules --dry-run    # 仅分析不修改
 ```
 
 ## 一键卸载
