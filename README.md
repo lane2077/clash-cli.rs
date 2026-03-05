@@ -35,7 +35,6 @@ curl -fsSL https://ghfast.top/https://raw.githubusercontent.com/lane2077/clash-c
 ```
 
 ## 仅安装 CLI（二进制）
-
 ```bash
 curl -fsSL https://raw.githubusercontent.com/lane2077/clash-cli.rs/main/scripts/install.sh | bash -s -- --skip-setup
 ```

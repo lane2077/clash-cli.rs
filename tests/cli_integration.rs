@@ -98,3 +98,101 @@ fn json_core_version_should_mark_uninstalled_on_new_home() {
 
     let _ = fs::remove_dir_all(&home);
 }
+
+#[test]
+fn help_should_contain_mixin_and_update() {
+    let output = Command::new(binary_path())
+        .arg("--help")
+        .output()
+        .expect("执行 --help 失败");
+    assert!(output.status.success());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("update"), "帮助信息缺少 update 命令");
+    assert!(stdout.contains("mixin"), "帮助信息缺少 mixin 关键字");
+}
+
+#[test]
+fn json_mixin_show_should_return_empty_on_new_home() {
+    let home = temp_home("mixin_show");
+    fs::create_dir_all(&home).expect("创建测试目录失败");
+    let output = run_with_home(&home, &["--json", "profile", "mixin", "show"]);
+    assert!(output.status.success());
+
+    let text = String::from_utf8_lossy(&output.stdout);
+    let value: serde_json::Value = serde_json::from_str(&text).expect("输出不是合法 JSON");
+    assert_eq!(value["ok"], true);
+    assert_eq!(value["exists"], false);
+    assert_eq!(value["content"], serde_json::Value::Null);
+
+    let _ = fs::remove_dir_all(&home);
+}
+
+#[test]
+fn json_mixin_set_and_show_should_persist() {
+    let home = temp_home("mixin_set");
+    fs::create_dir_all(&home).expect("创建测试目录失败");
+
+    let output = run_with_home(
+        &home,
+        &[
+            "--json",
+            "profile",
+            "mixin",
+            "set",
+            "--key",
+            "tun.enable",
+            "--value",
+            "true",
+        ],
+    );
+    assert!(output.status.success());
+    let text = String::from_utf8_lossy(&output.stdout);
+    let value: serde_json::Value = serde_json::from_str(&text).expect("输出不是合法 JSON");
+    assert_eq!(value["ok"], true);
+    assert_eq!(value["action"], "profile.mixin.set");
+
+    let output = run_with_home(&home, &["--json", "profile", "mixin", "show"]);
+    assert!(output.status.success());
+    let text = String::from_utf8_lossy(&output.stdout);
+    let value: serde_json::Value = serde_json::from_str(&text).expect("输出不是合法 JSON");
+    assert_eq!(value["exists"], true);
+    let tun_enable = &value["content"]["tun"]["enable"];
+    assert_eq!(*tun_enable, serde_json::Value::Bool(true));
+
+    let _ = fs::remove_dir_all(&home);
+}
+
+#[test]
+fn json_mixin_reset_should_clear() {
+    let home = temp_home("mixin_reset");
+    fs::create_dir_all(&home).expect("创建测试目录失败");
+
+    run_with_home(
+        &home,
+        &[
+            "--json",
+            "profile",
+            "mixin",
+            "set",
+            "--key",
+            "dns.enable",
+            "--value",
+            "true",
+        ],
+    );
+
+    let output = run_with_home(&home, &["--json", "profile", "mixin", "reset"]);
+    assert!(output.status.success());
+    let text = String::from_utf8_lossy(&output.stdout);
+    let value: serde_json::Value = serde_json::from_str(&text).expect("输出不是合法 JSON");
+    assert_eq!(value["ok"], true);
+    assert_eq!(value["existed"], true);
+
+    let output = run_with_home(&home, &["--json", "profile", "mixin", "show"]);
+    assert!(output.status.success());
+    let text = String::from_utf8_lossy(&output.stdout);
+    let value: serde_json::Value = serde_json::from_str(&text).expect("输出不是合法 JSON");
+    assert_eq!(value["exists"], false);
+
+    let _ = fs::remove_dir_all(&home);
+}

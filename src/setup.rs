@@ -9,8 +9,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 
-use crate::auto_sudo;
 use crate::api;
+use crate::auto_sudo;
 use crate::cli::{
     Amd64Variant, ApiCommand, ApiCommonArgs, CoreCommand, CoreInstallArgs, MirrorSource,
     ProfileAddArgs, ProfileCommand, ProfileFetchArgs, ProfileRenderArgs, ProfileUseArgs,
@@ -180,12 +180,8 @@ fn cmd_unify(args: SetupUnifyArgs) -> Result<()> {
         if !src_index_file.exists() {
             continue;
         }
-        let src_index = load_profile_index(&src_index_file).with_context(|| {
-            format!(
-                "读取来源 profile 索引失败: {}",
-                src_index_file.display()
-            )
-        })?;
+        let src_index = load_profile_index(&src_index_file)
+            .with_context(|| format!("读取来源 profile 索引失败: {}", src_index_file.display()))?;
         println!("发现来源目录: {}", src_dir.display());
         if candidate_active.is_none() {
             candidate_active = src_index.active.clone();
@@ -352,10 +348,7 @@ fn is_root_user() -> Result<bool> {
 
 fn ensure_setup_home_for_root() {
     if env::var_os("CLASH_CLI_HOME").is_none() {
-        // 仅在命令主流程早期设置一次，后续同进程不会并发修改环境变量。
-        unsafe {
-            env::set_var("CLASH_CLI_HOME", DEFAULT_SYSTEM_HOME);
-        }
+        crate::paths::set_home_override(PathBuf::from(DEFAULT_SYSTEM_HOME));
         println!(
             "未设置 CLASH_CLI_HOME，默认使用系统目录: {}",
             DEFAULT_SYSTEM_HOME
@@ -510,14 +503,15 @@ fn load_profile_index(path: &Path) -> Result<ProfileIndex> {
     if !path.exists() {
         return Ok(ProfileIndex::default());
     }
-    let content =
-        fs::read_to_string(path).with_context(|| format!("读取 profile 索引失败: {}", path.display()))?;
+    let content = fs::read_to_string(path)
+        .with_context(|| format!("读取 profile 索引失败: {}", path.display()))?;
     serde_json::from_str(&content).context("解析 profile 索引失败")
 }
 
 fn save_profile_index(path: &Path, index: &ProfileIndex) -> Result<()> {
     if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent).with_context(|| format!("创建目录失败: {}", parent.display()))?;
+        fs::create_dir_all(parent)
+            .with_context(|| format!("创建目录失败: {}", parent.display()))?;
     }
     let content = serde_json::to_string_pretty(index).context("序列化 profile 索引失败")?;
     fs::write(path, content).with_context(|| format!("写入 profile 索引失败: {}", path.display()))
@@ -557,7 +551,11 @@ fn merge_profile_entry(
         let dst_file = dest_profile_dir.join(&existing.file);
         if !dst_file.exists() {
             fs::copy(&src_file, &dst_file).with_context(|| {
-                format!("复制 profile 文件失败: {} -> {}", src_file.display(), dst_file.display())
+                format!(
+                    "复制 profile 文件失败: {} -> {}",
+                    src_file.display(),
+                    dst_file.display()
+                )
             })?;
         }
         stats.existed += 1;
@@ -640,7 +638,9 @@ fn link_source_dirs_to_system(
 
 fn build_backup_path(path: &Path) -> PathBuf {
     let parent = path.parent().unwrap_or(Path::new("/"));
-    let base_name = path.file_name().unwrap_or_else(|| std::ffi::OsStr::new("clash-cli"));
+    let base_name = path
+        .file_name()
+        .unwrap_or_else(|| std::ffi::OsStr::new("clash-cli"));
     let ts = now_unix();
     let mut idx: u32 = 0;
     loop {

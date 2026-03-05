@@ -37,7 +37,7 @@ pub enum Commands {
         #[command(subcommand)]
         command: TunCommand,
     },
-    #[command(about = "管理订阅 profile（add/fetch/render/validate）")]
+    #[command(about = "管理订阅 profile（add/fetch/render/validate/mixin）")]
     Profile {
         #[command(subcommand)]
         command: ProfileCommand,
@@ -51,6 +51,16 @@ pub enum Commands {
     Setup {
         #[command(subcommand)]
         command: SetupCommand,
+    },
+    #[command(about = "更新 clash CLI 自身到最新版本")]
+    Update {
+        #[command(subcommand)]
+        command: UpdateCommand,
+    },
+    #[command(about = "AI 智能分析连接日志并优化路由规则")]
+    Ai {
+        #[command(subcommand)]
+        command: AiCommand,
     },
 }
 
@@ -136,6 +146,11 @@ pub enum ProfileCommand {
     Render(ProfileRenderArgs),
     #[command(about = "校验 profile YAML 基础合法性")]
     Validate(ProfileValidateArgs),
+    #[command(about = "管理 mixin.yaml 覆盖配置（show/set/unset/reset）")]
+    Mixin {
+        #[command(subcommand)]
+        command: MixinCommand,
+    },
 }
 
 #[derive(Subcommand)]
@@ -531,4 +546,105 @@ pub enum Amd64Variant {
     Auto,
     Compatible,
     V3,
+}
+
+// --- Mixin 子命令 ---
+
+#[derive(Subcommand, Clone)]
+pub enum MixinCommand {
+    #[command(about = "查看当前 mixin.yaml 内容")]
+    Show,
+    #[command(about = "按 YAML 点路径设置 mixin 字段")]
+    Set(MixinSetArgs),
+    #[command(about = "按 YAML 点路径删除 mixin 字段")]
+    Unset(MixinSetArgs),
+    #[command(about = "删除 mixin.yaml，恢复到无 mixin 状态")]
+    Reset,
+}
+
+#[derive(Args, Clone)]
+pub struct MixinSetArgs {
+    #[arg(long, help = "YAML 点分路径，如 tun.enable 或 dns.enhanced-mode")]
+    pub key: String,
+    #[arg(
+        long,
+        default_value = "",
+        help = "要设置的值（自动推导类型：bool/int/string）"
+    )]
+    pub value: String,
+}
+
+// --- Update 命令 ---
+
+#[derive(Subcommand)]
+pub enum UpdateCommand {
+    #[command(about = "下载最新版本 CLI 并替换当前二进制")]
+    Run(UpdateArgs),
+    #[command(about = "仅检查是否有新版本，不执行更新")]
+    Check(UpdateArgs),
+}
+
+#[derive(Args, Clone)]
+pub struct UpdateArgs {
+    #[arg(
+        long,
+        value_enum,
+        default_value_t = MirrorSource::Auto,
+        help = "下载镜像策略"
+    )]
+    pub mirror: MirrorSource,
+}
+
+// --- AI 命令 ---
+
+#[derive(Subcommand)]
+pub enum AiCommand {
+    #[command(about = "分析连接日志，AI 自动优化路由规则")]
+    Rules(AiRulesArgs),
+    #[command(about = "列出可用 LLM 模型")]
+    Models(AiModelsArgs),
+}
+
+#[derive(Args, Clone)]
+pub struct AiRulesArgs {
+    #[arg(long, env = "OPENAI_API_KEY", help = "OpenAI API Key")]
+    pub api_key: Option<String>,
+
+    #[arg(
+        long,
+        default_value = "https://api.openai.com/v1",
+        help = "API 地址（支持 OpenAI 兼容端点）"
+    )]
+    pub api_base: String,
+
+    #[arg(long, default_value = "gpt-4o", help = "模型名称")]
+    pub model: String,
+
+    #[arg(
+        long,
+        default_value = "completions",
+        help = "API 协议：completions 或 responses"
+    )]
+    pub protocol: String,
+
+    #[arg(long, default_value_t = 20, help = "最大 agent loop 轮次")]
+    pub max_turns: usize,
+
+    #[arg(long, help = "仅分析不执行写操作")]
+    pub dry_run: bool,
+
+    #[arg(long, help = "mihomo API 地址")]
+    pub controller: Option<String>,
+
+    #[arg(long, help = "mihomo API secret")]
+    pub secret: Option<String>,
+}
+
+#[derive(Args, Clone)]
+pub struct AiModelsArgs {
+    #[arg(long, env = "OPENAI_API_KEY", help = "OpenAI API Key")]
+    pub api_key: Option<String>,
+
+    #[arg(long, default_value = "https://api.openai.com/v1", help = "API 地址")]
+    pub api_base: String,
 }

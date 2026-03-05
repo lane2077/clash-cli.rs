@@ -1,8 +1,17 @@
 use std::env;
 use std::path::PathBuf;
 use std::process::Command;
+use std::sync::OnceLock;
 
 use anyhow::{Context, Result};
+
+static HOME_OVERRIDE: OnceLock<PathBuf> = OnceLock::new();
+
+/// 设置全局 home 目录覆盖（安全，无需 unsafe env::set_var）。
+/// 仅在 setup init/unify 等需要强制指定 home 的场景调用。
+pub fn set_home_override(path: PathBuf) {
+    let _ = HOME_OVERRIDE.set(path);
+}
 
 #[derive(Debug, Clone)]
 pub struct AppPaths {
@@ -22,7 +31,9 @@ pub struct AppPaths {
 }
 
 pub fn app_paths() -> Result<AppPaths> {
-    let config_dir = if let Some(custom) = env::var_os("CLASH_CLI_HOME") {
+    let config_dir = if let Some(override_home) = HOME_OVERRIDE.get() {
+        override_home.clone()
+    } else if let Some(custom) = env::var_os("CLASH_CLI_HOME") {
         PathBuf::from(custom)
     } else if is_root_user() {
         // Linux 服务场景下，root 默认统一使用系统目录，避免落到 /root/.config 造成双配置源。

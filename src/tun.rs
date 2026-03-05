@@ -1268,7 +1268,10 @@ enum PrivilegeCheck {
     Delegated,
 }
 
-fn ensure_tun_privileges_or_delegate(action: TunAction, args: &TunApplyArgs) -> Result<PrivilegeCheck> {
+fn ensure_tun_privileges_or_delegate(
+    action: TunAction,
+    args: &TunApplyArgs,
+) -> Result<PrivilegeCheck> {
     if ensure_tun_privileges().is_ok() {
         return Ok(PrivilegeCheck::Ok);
     }
@@ -1316,7 +1319,10 @@ fn ensure_tun_doctor_privileges_or_delegate() -> Result<PrivilegeCheck> {
     bail!("sudo 授权未通过或命令执行失败，请手动执行: sudo clash tun doctor");
 }
 
-fn run_tun_apply_with_sudo(action: TunAction, args: &TunApplyArgs) -> Result<std::process::ExitStatus> {
+fn run_tun_apply_with_sudo(
+    action: TunAction,
+    args: &TunApplyArgs,
+) -> Result<std::process::ExitStatus> {
     auto_sudo::run_with_sudo(is_json_mode(), |cmd| {
         cmd.arg("tun");
         cmd.arg(action.as_cli_str());

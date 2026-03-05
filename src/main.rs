@@ -1,7 +1,12 @@
+mod ai;
+mod ai_protocol;
+mod ai_tools;
 mod api;
 mod auto_sudo;
 mod cli;
 mod core;
+mod http;
+mod mixin;
 mod output;
 mod paths;
 mod profile;
@@ -9,6 +14,7 @@ mod proxy;
 mod service;
 mod setup;
 mod tun;
+mod update;
 
 use anyhow::Result;
 use clap::Parser;
@@ -41,6 +47,8 @@ fn run() -> Result<()> {
         Commands::Profile { command } => profile::run(command)?,
         Commands::Api { command } => api::run(command)?,
         Commands::Setup { command } => setup::run(command)?,
+        Commands::Update { command } => update::run(command)?,
+        Commands::Ai { command } => ai::run(command)?,
     }
 
     Ok(())

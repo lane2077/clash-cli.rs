@@ -4,14 +4,14 @@ use std::fs::File;
 use std::io::{self, Write};
 use std::os::unix::fs::{PermissionsExt, symlink};
 use std::path::Path;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, bail};
 use flate2::read::GzDecoder;
-use reqwest::blocking::Client;
 use serde::Deserialize;
 
 use crate::cli::{Amd64Variant, CoreCommand, CoreInstallArgs, CoreUpgradeArgs, MirrorSource};
+use crate::http::{build_http_client, download_candidates, download_to_file};
 use crate::output::{is_json_mode, print_json};
 use crate::paths::app_paths;
 
@@ -232,16 +232,7 @@ fn ensure_linux_host() -> Result<()> {
     Ok(())
 }
 
-fn build_http_client() -> Result<Client> {
-    Client::builder()
-        .timeout(Duration::from_secs(180))
-        .connect_timeout(Duration::from_secs(20))
-        .user_agent("clash-cli/0.1")
-        .build()
-        .context("创建 HTTP 客户端失败")
-}
-
-fn fetch_release(client: &Client, version: &str) -> Result<GitHubRelease> {
+fn fetch_release(client: &reqwest::blocking::Client, version: &str) -> Result<GitHubRelease> {
     let url = if version == "latest" {
         RELEASES_LATEST_API.to_string()
     } else {
@@ -317,41 +308,6 @@ fn pick_asset_by_keywords(assets: &[GitHubAsset], keywords: &[&str]) -> Result<G
     }
     let joined = keywords.join(", ");
     bail!("未找到匹配资产，关键词: {joined}")
-}
-
-fn download_candidates(original_url: &str, mirror: MirrorSource) -> Vec<String> {
-    let mut urls = Vec::new();
-    let ghfast_url = format!("https://ghfast.top/{original_url}");
-
-    match mirror {
-        MirrorSource::Auto => {
-            if original_url.starts_with("https://github.com/") {
-                urls.push(ghfast_url);
-            }
-            urls.push(original_url.to_string());
-        }
-        MirrorSource::Ghfast => urls.push(ghfast_url),
-        MirrorSource::Github => urls.push(original_url.to_string()),
-    }
-
-    urls
-}
-
-fn download_to_file(client: &Client, url: &str, output_path: &Path) -> Result<()> {
-    let mut response = client
-        .get(url)
-        .send()
-        .with_context(|| format!("下载请求失败: {url}"))?
-        .error_for_status()
-        .with_context(|| format!("下载响应失败: {url}"))?;
-
-    let mut file = File::create(output_path)
-        .with_context(|| format!("创建下载文件失败: {}", output_path.display()))?;
-    io::copy(&mut response, &mut file)
-        .with_context(|| format!("写入文件失败: {}", output_path.display()))?;
-    file.flush()
-        .with_context(|| format!("刷新文件失败: {}", output_path.display()))?;
-    Ok(())
 }
 
 fn decompress_gzip_to_file(input_gz_path: &Path, output_path: &Path) -> Result<()> {

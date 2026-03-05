@@ -42,6 +42,14 @@ const DEFAULT_LOCAL_EXTERNAL_UI_URL: &str =
 const DEFAULT_SYSTEM_SERVICE_NAME: &str = "clash-mihomo.service";
 
 pub fn run(command: ProfileCommand) -> Result<()> {
+    // Mixin 子命令有自己的 auto_sudo 逻辑，直接转发
+    if let ProfileCommand::Mixin {
+        command: ref mixin_cmd,
+    } = command
+    {
+        return crate::mixin::run(mixin_cmd.clone());
+    }
+
     let retry_command = command.clone();
     let result = match command {
         ProfileCommand::Add(args) => cmd_add(args),
@@ -51,6 +59,7 @@ pub fn run(command: ProfileCommand) -> Result<()> {
         ProfileCommand::Remove(args) => cmd_remove(args),
         ProfileCommand::Render(args) => cmd_render(args),
         ProfileCommand::Validate(args) => cmd_validate(args),
+        ProfileCommand::Mixin { .. } => unreachable!(),
     };
 
     match result {
@@ -152,7 +161,10 @@ fn cmd_use(args: ProfileUseArgs) -> Result<()> {
     let apply = args.apply || args.fetch;
 
     if apply && !args.no_restart {
-        ensure_service_runtime_home_matches_current(&args.service_name, &paths.runtime_config_file)?;
+        ensure_service_runtime_home_matches_current(
+            &args.service_name,
+            &paths.runtime_config_file,
+        )?;
     }
 
     let mut index = load_index(&paths.profile_index_file)?;
@@ -599,7 +611,9 @@ fn ensure_service_runtime_home_matches_current(
             home.display()
         ));
     } else {
-        message.push_str("\n请保证 service 的 -f 路径与 CLASH_CLI_HOME/runtime/config.yaml 指向同一份配置。");
+        message.push_str(
+            "\n请保证 service 的 -f 路径与 CLASH_CLI_HOME/runtime/config.yaml 指向同一份配置。",
+        );
     }
 
     bail!("配置目录不一致，已阻止继续执行。\n{message}");
@@ -796,6 +810,7 @@ fn profile_command_to_cli_args(command: &ProfileCommand) -> Result<Vec<String>> 
                 args.push(name.clone());
             }
         }
+        ProfileCommand::Mixin { .. } => unreachable!(),
     }
     Ok(args)
 }
