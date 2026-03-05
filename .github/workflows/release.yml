@@ -1,6 +1,8 @@
 name: Release
 
 on:
+  workflow_dispatch:
+
   push:
     tags:
       - "v*"
@@ -24,6 +26,8 @@ jobs:
             archive_name: clash-linux-arm64.tar.gz
 
     runs-on: ${{ matrix.runner }}
+  workflow_dispatch:
+
 
     steps:
       - name: 检出代码
@@ -56,6 +60,8 @@ jobs:
   release:
     needs: build
     runs-on: ubuntu-latest
+  workflow_dispatch:
+
 
     steps:
       - name: 检出代码

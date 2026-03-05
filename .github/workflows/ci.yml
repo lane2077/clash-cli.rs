@@ -1,6 +1,8 @@
 name: CI
 
 on:
+  workflow_dispatch:
+
   push:
     branches:
       - main
@@ -11,6 +13,8 @@ on:
 jobs:
   build-and-test:
     runs-on: ubuntu-latest
+  workflow_dispatch:
+
 
     steps:
       - name: 检出代码
