@@ -1,4 +1,5 @@
 mod ai;
+mod ai_config;
 mod ai_protocol;
 mod ai_tools;
 mod api;

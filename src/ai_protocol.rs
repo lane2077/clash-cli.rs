@@ -206,10 +206,11 @@ fn call_responses(
     let text = response.text().context("读取 Responses API 响应失败")?;
 
     if !status.is_success() {
-        bail!("Responses API 错误 ({}): {}", status, truncate(&text, 500));
+        bail!("Responses API 错误 ({}): {}", status, text);
     }
 
     let json: Value = serde_json::from_str(&text).context("解析 Responses API JSON 失败")?;
+    println!("--- Turn RAW Responses JSON ---\n{}\n---", json);
 
     let output = json
         .get("output")

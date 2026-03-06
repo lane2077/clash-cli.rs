@@ -1,14 +1,16 @@
 use std::io::IsTerminal;
 
 use anyhow::{Context, Result};
+use reqwest::blocking::Client;
 use serde_json::Value;
 
+use crate::ai_config;
 use crate::ai_protocol::{
-    self, LlmConfig, LlmResponse, Protocol, assistant_tool_calls_message,
+    self, LlmConfig, LlmResponse, Protocol, ToolDef, assistant_tool_calls_message,
     tool_result_message_completions, tool_result_message_responses,
 };
 use crate::ai_tools::{self, MihomoCtx};
-use crate::cli::{AiCommand, AiRulesArgs};
+use crate::cli::{AiCommand, AiModelsArgs, AiRulesArgs};
 use crate::output::{is_json_mode, print_json};
 use crate::paths::app_paths;
 
@@ -19,10 +21,26 @@ pub fn run(command: AiCommand) -> Result<()> {
     }
 }
 
-fn cmd_models(args: crate::cli::AiModelsArgs) -> Result<()> {
-    let api_key = resolve_api_key(&args.api_key)?;
+fn cmd_models(args: AiModelsArgs) -> Result<()> {
+    let mut cfg = ai_config::load()?;
+    let api_key = args
+        .api_key
+        .clone()
+        .or_else(|| cfg.api_key.clone())
+        .or_else(|| std::env::var("OPENAI_API_KEY").ok())
+        .context("未提供 API Key。请设置 OPENAI_API_KEY 环境变量或使用 --api-key 参数")?;
+    let api_base = args
+        .api_base
+        .clone()
+        .or_else(|| cfg.api_base.clone())
+        .unwrap_or_else(|| "https://api.openai.com/v1".to_string());
+
+    cfg.api_key = Some(api_key.clone());
+    cfg.api_base = Some(api_base.clone());
+    let _ = ai_config::save(&cfg);
+
     let client = ai_protocol::build_llm_client()?;
-    let models = ai_protocol::list_models(&client, &args.api_base, &api_key)?;
+    let models = ai_protocol::list_models(&client, &api_base, &api_key)?;
 
     if is_json_mode() {
         return print_json(&serde_json::json!({
@@ -46,18 +64,47 @@ fn cmd_models(args: crate::cli::AiModelsArgs) -> Result<()> {
 }
 
 fn cmd_rules(args: AiRulesArgs) -> Result<()> {
-    let api_key = resolve_api_key(&args.api_key)?;
-    let protocol = match args.protocol.as_str() {
+    let mut cfg = ai_config::load()?;
+    let api_key = args
+        .api_key
+        .clone()
+        .or_else(|| cfg.api_key.clone())
+        .or_else(|| std::env::var("OPENAI_API_KEY").ok())
+        .context("未提供 API Key。请设置 OPENAI_API_KEY 环境变量或使用 --api-key 参数")?;
+
+    let api_base = args
+        .api_base
+        .clone()
+        .or_else(|| cfg.api_base.clone())
+        .unwrap_or_else(|| "https://api.openai.com/v1".to_string());
+    let init_model = args
+        .model
+        .clone()
+        .or_else(|| cfg.model.clone())
+        .unwrap_or_else(|| "gpt-4o".to_string());
+    let protocol_str = args
+        .protocol
+        .clone()
+        .or_else(|| cfg.protocol.clone())
+        .unwrap_or_else(|| "responses".to_string());
+
+    let protocol = match protocol_str.as_str() {
         "responses" => Protocol::Responses,
         _ => Protocol::Completions,
     };
 
-    let model = select_model(&args)?;
+    let final_model = select_model(&init_model, &api_base, &api_key)?;
+
+    cfg.api_key = Some(api_key.clone());
+    cfg.api_base = Some(api_base.clone());
+    cfg.model = Some(final_model.clone());
+    cfg.protocol = Some(protocol_str.clone());
+    let _ = ai_config::save(&cfg);
 
     let config = LlmConfig {
-        api_base: args.api_base.clone(),
+        api_base: api_base.clone(),
         api_key,
-        model: model.clone(),
+        model: final_model.clone(),
         protocol,
     };
 
@@ -73,38 +120,144 @@ fn cmd_rules(args: AiRulesArgs) -> Result<()> {
         "content": system_prompt,
     })];
 
-    // 初始用户消息
-    messages.push(serde_json::json!({
-        "role": "user",
-        "content": "请分析当前的连接情况和路由规则，找出配置不合理的地方，并给出优化建议。如果我没有使用 --dry-run 模式，你可以直接修改规则并验证效果。",
-    }));
-
     if !is_json_mode() {
-        println!("AI 规则分析启动（模型: {}，协议: {:?}）", model, protocol);
+        println!(
+            "AI 规则分析启动（模型: {}，协议: {:?}）",
+            final_model, protocol
+        );
         if args.dry_run {
             println!("[dry-run 模式] 写操作将模拟执行，不会实际修改配置");
         }
+        println!("输入消息与 AI 对话，输入 exit 或按 Ctrl+C 退出");
         println!("---");
     }
 
-    // Agent Loop
+    // 初始用户消息
+    let initial_msg = "请分析当前的连接情况和路由规则，找出配置不合理的地方，并给出优化建议。如果我没有使用 --dry-run 模式，你可以直接修改规则并验证效果。";
+    messages.push(serde_json::json!({ "role": "user", "content": initial_msg }));
+
+    // JSON 模式下只跑一次
+    if is_json_mode() {
+        return run_single_pass(&client, &config, &mut messages, &tools, &mihomo, &args);
+    }
+
+    // 多轮对话循环
+    let is_interactive = std::io::stdin().is_terminal();
+    loop {
+        // Agent Loop: 处理当前消息
+        let reply = run_agent_loop(&client, &config, &mut messages, &tools, &mihomo, &args);
+
+        match reply {
+            Ok(text) => println!("\n{}", text),
+            Err(e) => eprintln!("\nAI 调用出错: {}", e),
+        }
+
+        if !is_interactive {
+            return Ok(());
+        }
+
+        // 等待用户输入下一条消息
+        println!();
+        use std::io::Write;
+        print!("You> ");
+        std::io::stdout().flush().unwrap();
+
+        let mut input = String::new();
+        if std::io::stdin().read_line(&mut input).is_err() || input.is_empty() {
+            break;
+        }
+        let trimmed = input.trim();
+        if trimmed.is_empty() || trimmed == "exit" || trimmed == "quit" {
+            break;
+        }
+
+        messages.push(serde_json::json!({ "role": "user", "content": trimmed }));
+    }
+
+    println!("AI 对话结束。");
+    Ok(())
+}
+
+fn run_single_pass(
+    client: &Client,
+    config: &LlmConfig,
+    messages: &mut Vec<Value>,
+    tools: &[ToolDef],
+    mihomo: &MihomoCtx,
+    args: &AiRulesArgs,
+) -> Result<()> {
     let max_turns = args.max_turns;
     for turn in 0..max_turns {
-        let response = ai_protocol::call_llm(&client, &config, &messages, &tools)
+        let response = ai_protocol::call_llm(client, config, messages, tools)
             .with_context(|| format!("第 {} 轮 LLM 调用失败", turn + 1))?;
 
         match response {
             LlmResponse::Text(text) => {
-                if is_json_mode() {
-                    return print_json(&serde_json::json!({
-                        "ok": true,
-                        "action": "ai.rules",
-                        "turns": turn + 1,
-                        "result": text,
-                    }));
+                return print_json(&serde_json::json!({
+                    "ok": true,
+                    "action": "ai.rules",
+                    "turns": turn + 1,
+                    "result": text,
+                }));
+            }
+            LlmResponse::ToolCalls(tool_calls) => {
+                // 将 assistant 的 tool_calls 消息加入历史
+                match config.protocol {
+                    Protocol::Completions => {
+                        messages.push(assistant_tool_calls_message(&tool_calls));
+                    }
+                    Protocol::Responses => {
+                        // Responses API 期望传入 function_call 原节点
+                        for tc in &tool_calls {
+                            messages.push(serde_json::json!({
+                                "type": "function_call",
+                                "id": format!("fc_{}", tc.id), // padding id
+                                "call_id": tc.id,
+                                "name": tc.name,
+                                "arguments": tc.arguments,
+                            }));
+                        }
+                    }
                 }
-                println!("{}", text);
-                return Ok(());
+
+                // 执行每个工具调用并将结果加入历史
+                for tc in &tool_calls {
+                    let result =
+                        ai_tools::execute_tool(&tc.name, &tc.arguments, mihomo, args.dry_run);
+
+                    let result_msg = match config.protocol {
+                        Protocol::Completions => tool_result_message_completions(&tc.id, &result),
+                        Protocol::Responses => tool_result_message_responses(&tc.id, &result),
+                    };
+                    messages.push(result_msg);
+                }
+            }
+        }
+    }
+
+    print_json(&serde_json::json!({
+        "ok": false,
+        "action": "ai.rules",
+        "error": format!("达到最大轮次限制 ({max_turns})"),
+    }))
+}
+
+fn run_agent_loop(
+    client: &Client,
+    config: &LlmConfig,
+    messages: &mut Vec<Value>,
+    tools: &[ToolDef],
+    mihomo: &MihomoCtx,
+    args: &AiRulesArgs,
+) -> Result<String> {
+    let max_turns = args.max_turns;
+    for turn in 0..max_turns {
+        let response = ai_protocol::call_llm(client, config, messages, tools)
+            .with_context(|| format!("第 {} 轮 LLM 调用失败", turn + 1))?;
+
+        match response {
+            LlmResponse::Text(text) => {
+                return Ok(text);
             }
             LlmResponse::ToolCalls(tool_calls) => {
                 if !is_json_mode() {
@@ -119,14 +272,41 @@ fn cmd_rules(args: AiRulesArgs) -> Result<()> {
                 }
 
                 // 将 assistant 的 tool_calls 消息加入历史
-                messages.push(assistant_tool_calls_message(&tool_calls));
+                match config.protocol {
+                    Protocol::Completions => {
+                        messages.push(assistant_tool_calls_message(&tool_calls));
+                    }
+                    Protocol::Responses => {
+                        // Responses API 期望传入 function_call 原节点
+                        for tc in &tool_calls {
+                            messages.push(serde_json::json!({
+                                "type": "function_call",
+                                "id": format!("fc_{}", tc.id), // padding id
+                                "call_id": tc.id,
+                                "name": tc.name,
+                                "arguments": tc.arguments,
+                            }));
+                        }
+                    }
+                }
 
                 // 执行每个工具调用并将结果加入历史
                 for tc in &tool_calls {
-                    let result =
-                        ai_tools::execute_tool(&tc.name, &tc.arguments, &mihomo, args.dry_run);
+                    let mut result = String::new();
+                    let is_write = tc.name == "set_mixin_field" || tc.name == "unset_mixin_field";
 
-                    let result_msg = match protocol {
+                    if is_write && !args.dry_run {
+                        if !ask_for_approval(&tc.name, &tc.arguments) {
+                            result = "User denied permission to execute this tool.".to_string();
+                        }
+                    }
+
+                    if result.is_empty() {
+                        result =
+                            ai_tools::execute_tool(&tc.name, &tc.arguments, mihomo, args.dry_run);
+                    }
+
+                    let result_msg = match config.protocol {
                         Protocol::Completions => tool_result_message_completions(&tc.id, &result),
                         Protocol::Responses => tool_result_message_responses(&tc.id, &result),
                     };
@@ -136,17 +316,10 @@ fn cmd_rules(args: AiRulesArgs) -> Result<()> {
         }
     }
 
-    if is_json_mode() {
-        return print_json(&serde_json::json!({
-            "ok": false,
-            "action": "ai.rules",
-            "error": format!("达到最大轮次限制 ({max_turns})"),
-        }));
-    }
-
-    println!("---");
-    println!("达到最大轮次限制 ({})，AI 分析结束。", max_turns);
-    Ok(())
+    Err(anyhow::anyhow!(
+        "达到最大轮次限制 ({})，AI 未能给出最终回复。",
+        max_turns
+    ))
 }
 
 fn build_system_prompt() -> String {
@@ -178,12 +351,20 @@ fn build_system_prompt() -> String {
 - 输出最终分析报告时使用中文"#.to_string()
 }
 
-fn resolve_api_key(explicit: &Option<String>) -> Result<String> {
-    if let Some(key) = explicit {
-        return Ok(key.clone());
+fn ask_for_approval(name: &str, args: &str) -> bool {
+    if is_json_mode() || !std::io::stdin().is_terminal() {
+        return false;
     }
-    std::env::var("OPENAI_API_KEY")
-        .context("未提供 API Key。请设置 OPENAI_API_KEY 环境变量或使用 --api-key 参数")
+    use std::io::Write;
+    print!(
+        "\n⚠️  AI 尝试执行写操作: {}({})\n是否允许执行? [y/N]: ",
+        name, args
+    );
+    std::io::stdout().flush().unwrap();
+
+    let mut input = String::new();
+    std::io::stdin().read_line(&mut input).unwrap();
+    input.trim().eq_ignore_ascii_case("y")
 }
 
 fn resolve_controller(explicit: &Option<String>) -> Result<String> {
@@ -209,31 +390,23 @@ fn resolve_controller(explicit: &Option<String>) -> Result<String> {
 }
 
 /// 模型选择：如果用户明确指定了 --model 则直接使用，否则尝试交互选择
-fn select_model(args: &AiRulesArgs) -> Result<String> {
-    // 如果用户明确指定了非默认模型，直接用
-    if args.model != "gpt-4o" {
-        return Ok(args.model.clone());
+fn select_model(current_model: &str, api_base: &str, api_key: &str) -> Result<String> {
+    if current_model != "gpt-4o" {
+        return Ok(current_model.to_string());
     }
 
-    // 非交互终端或 json 模式，直接用默认
     if is_json_mode() || !std::io::stdin().is_terminal() {
-        return Ok(args.model.clone());
+        return Ok(current_model.to_string());
     }
-
-    // 尝试获取模型列表供交互选择
-    let api_key = match resolve_api_key(&args.api_key) {
-        Ok(k) => k,
-        Err(_) => return Ok(args.model.clone()),
-    };
 
     let client = match ai_protocol::build_llm_client() {
         Ok(c) => c,
-        Err(_) => return Ok(args.model.clone()),
+        Err(_) => return Ok(current_model.to_string()),
     };
 
-    let models = match ai_protocol::list_models(&client, &args.api_base, &api_key) {
+    let models = match ai_protocol::list_models(&client, api_base, api_key) {
         Ok(m) if !m.is_empty() => m,
-        _ => return Ok(args.model.clone()),
+        _ => return Ok(current_model.to_string()),
     };
 
     println!("可用模型 ({} 个):", models.len());
@@ -241,14 +414,14 @@ fn select_model(args: &AiRulesArgs) -> Result<String> {
         println!("  {:>3}. {}", i + 1, name);
     }
     println!();
-    println!("输入序号选择模型（直接回车使用默认 {}）:", args.model);
+    println!("输入序号选择模型（直接回车使用默认 {}）:", current_model);
 
     let mut input = String::new();
     std::io::stdin().read_line(&mut input).ok();
     let trimmed = input.trim();
 
     if trimmed.is_empty() {
-        return Ok(args.model.clone());
+        return Ok(current_model.to_string());
     }
 
     if let Ok(idx) = trimmed.parse::<usize>() {

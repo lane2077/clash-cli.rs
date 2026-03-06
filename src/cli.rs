@@ -612,20 +612,15 @@ pub struct AiRulesArgs {
 
     #[arg(
         long,
-        default_value = "https://api.openai.com/v1",
-        help = "API 地址（支持 OpenAI 兼容端点）"
+        help = "API 地址（支持 OpenAI 兼容端点），默认 https://api.openai.com/v1"
     )]
-    pub api_base: String,
+    pub api_base: Option<String>,
 
-    #[arg(long, default_value = "gpt-4o", help = "模型名称")]
-    pub model: String,
+    #[arg(long, help = "模型名称，默认 gpt-4o")]
+    pub model: Option<String>,
 
-    #[arg(
-        long,
-        default_value = "completions",
-        help = "API 协议：completions 或 responses"
-    )]
-    pub protocol: String,
+    #[arg(long, help = "API 协议：completions 或 responses，默认 responses")]
+    pub protocol: Option<String>,
 
     #[arg(long, default_value_t = 20, help = "最大 agent loop 轮次")]
     pub max_turns: usize,
@@ -645,6 +640,6 @@ pub struct AiModelsArgs {
     #[arg(long, env = "OPENAI_API_KEY", help = "OpenAI API Key")]
     pub api_key: Option<String>,
 
-    #[arg(long, default_value = "https://api.openai.com/v1", help = "API 地址")]
-    pub api_base: String,
+    #[arg(long, help = "API 地址，默认 https://api.openai.com/v1")]
+    pub api_base: Option<String>,
 }
