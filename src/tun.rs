@@ -272,9 +272,7 @@ fn cmd_on(args: TunApplyArgs) -> Result<()> {
     cleanup_dataplane_rules_all_best_effort();
     if !json_mode {
         if auto_redirect {
-            println!(
-                "已配置 auto-redirect=true，mihomo 将自行管理数据面规则"
-            );
+            println!("已配置 auto-redirect=true，mihomo 将自行管理数据面规则");
         } else {
             println!("检测到 tun.auto-redirect=false，已跳过规则下发。");
         }
