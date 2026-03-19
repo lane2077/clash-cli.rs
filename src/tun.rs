@@ -306,12 +306,16 @@ fn cmd_on(args: TunApplyArgs) -> Result<()> {
 
     // 动态检测 Docker 桥接接口，使用 exclude-interface 排除
     // 注意：不用 include-interface，它会干扰 mihomo 自身的出站路由
+    // 清理可能残留的 include-interface（两者互斥）
+    remove_tun_key(&mut root, "include-interface");
     let bridge_ifaces = detect_bridge_interfaces();
     if !bridge_ifaces.is_empty() {
         set_sequence_field(&mut root, &["tun"], "exclude-interface", &bridge_ifaces);
         if !json_mode {
             println!("已排除桥接接口: {}", bridge_ifaces.join(", "));
         }
+    } else {
+        remove_tun_key(&mut root, "exclude-interface");
     }
     // 检测需要排除的 UID（cloudflared 等服务进程）
     let excluded_uids = detect_exclude_uids();
@@ -1528,6 +1532,16 @@ fn ensure_mapping_path<'a>(root: &'a mut Value, path_keys: &[&str]) -> &'a mut M
         cursor = child;
     }
     cursor.as_mapping_mut().expect("mapping")
+}
+
+fn remove_tun_key(root: &mut Value, key: &str) {
+    if let Some(tun) = root
+        .as_mapping_mut()
+        .and_then(|m| m.get_mut(Value::String("tun".to_string())))
+        .and_then(|v| v.as_mapping_mut())
+    {
+        tun.remove(Value::String(key.to_string()));
+    }
 }
 
 fn set_sequence_field(root: &mut Value, path_keys: &[&str], key: &str, values: &[String]) {
