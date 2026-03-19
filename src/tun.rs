@@ -177,12 +177,53 @@ fn cmd_doctor() -> Result<()> {
     checks.extend(config_checks);
 
     if config_tun_enable && config_auto_redirect {
-        // auto-redirect 由 mihomo 自行管理 nft 规则，
-        // 只需确认服务正在运行即可。
         checks.push(pass(
             "数据面规则",
             "auto-redirect=true，由 mihomo 自行管理数据面规则",
         ));
+    }
+
+    // 检测 Docker 桥接接口与 tun 配置排除情况
+    let bridge_ifaces = detect_bridge_interfaces();
+    if !bridge_ifaces.is_empty() {
+        let tun = key_value(
+            &load_or_init_config(&paths.runtime_config_file)
+                .unwrap_or(Value::Mapping(Mapping::new())),
+            "tun",
+        )
+        .cloned();
+        let has_include = tun
+            .as_ref()
+            .and_then(|t| t.as_mapping())
+            .and_then(|m| m.get(Value::String("include-interface".to_string())))
+            .and_then(|v| v.as_sequence())
+            .map_or(false, |s| !s.is_empty());
+        let has_exclude = tun
+            .as_ref()
+            .and_then(|t| t.as_mapping())
+            .and_then(|m| m.get(Value::String("exclude-interface".to_string())))
+            .and_then(|v| v.as_sequence())
+            .map_or(false, |s| !s.is_empty());
+        if has_include || has_exclude {
+            checks.push(pass(
+                "Docker 桥接隔离",
+                &format!(
+                    "检测到 {} 个桥接接口 ({})，tun 配置已包含接口过滤",
+                    bridge_ifaces.len(),
+                    bridge_ifaces.join(", ")
+                ),
+            ));
+        } else {
+            checks.push(warn(
+                "Docker 桥接隔离",
+                &format!(
+                    "检测到 {} 个桥接接口 ({})，但 tun 未配置 include/exclude-interface",
+                    bridge_ifaces.len(),
+                    bridge_ifaces.join(", ")
+                ),
+                "建议执行 `clash tun on` 自动检测并配置接口白名单",
+            ));
+        }
     }
 
     let (pass_count, warn_count, fail_count) = if is_json_mode() {
@@ -260,6 +301,24 @@ fn cmd_on(args: TunApplyArgs) -> Result<()> {
     set_bool_field(&mut root, &["dns"], "ipv6", false);
     set_default_string_field(&mut root, &["dns"], "enhanced-mode", "fake-ip");
     set_default_u16_field(&mut root, &[], "redir-port", DEFAULT_REDIR_PORT);
+
+    // 动态检测物理网卡，使用 include-interface 白名单（比 exclude-interface 更安全）
+    let default_iface = detect_default_interface();
+    if let Some(ref iface) = default_iface {
+        set_sequence_field(&mut root, &["tun"], "include-interface", &[iface.clone()]);
+        if !json_mode {
+            println!("已检测到默认出口网卡: {}，仅代理该接口流量", iface);
+        }
+    }
+    // 检测需要排除的 UID（cloudflared 等服务进程）
+    let excluded_uids = detect_exclude_uids();
+    if !excluded_uids.is_empty() {
+        let uid_values: Vec<String> = excluded_uids.iter().map(|u| u.to_string()).collect();
+        set_sequence_field(&mut root, &["tun"], "exclude-uid", &uid_values);
+        if !json_mode {
+            println!("已检测到排除 UID: {}", uid_values.join(", "));
+        }
+    }
 
     let auto_redirect = bool_field(key_value(&root, "tun"), "auto-redirect").unwrap_or(false);
     let redir_port = u16_field(Some(&root), "redir-port").unwrap_or(DEFAULT_REDIR_PORT);
@@ -1457,6 +1516,129 @@ fn ensure_mapping_path<'a>(root: &'a mut Value, path_keys: &[&str]) -> &'a mut M
         cursor = child;
     }
     cursor.as_mapping_mut().expect("mapping")
+}
+
+fn set_sequence_field(root: &mut Value, path_keys: &[&str], key: &str, values: &[String]) {
+    let seq: Vec<Value> = values.iter().map(|v| Value::String(v.clone())).collect();
+    ensure_mapping_path(root, path_keys)
+        .insert(Value::String(key.to_string()), Value::Sequence(seq));
+}
+
+/// 检测默认路由出口网卡
+fn detect_default_interface() -> Option<String> {
+    let output = Command::new("ip")
+        .args(&["route", "show", "default"])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    // 格式: "default via 1.2.3.4 dev eth0 ..."
+    for line in stdout.lines() {
+        let parts: Vec<&str> = line.split_whitespace().collect();
+        if let Some(dev_idx) = parts.iter().position(|&p| p == "dev") {
+            if let Some(iface) = parts.get(dev_idx + 1) {
+                return Some(iface.to_string());
+            }
+        }
+    }
+    None
+}
+
+/// 检测系统中的桥接网络接口（Docker bridge 等），用于 doctor 诊断
+fn detect_bridge_interfaces() -> Vec<String> {
+    let output = match Command::new("ip")
+        .args(&["-o", "link", "show", "type", "bridge"])
+        .output()
+    {
+        Ok(o) if o.status.success() => o,
+        _ => return Vec::new(),
+    };
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let mut ifaces: Vec<String> = stdout
+        .lines()
+        .filter_map(|line| {
+            // 格式: "3: docker0: <...> ..."
+            let after_num = line.split_once(':')?;
+            let name_part = after_num.1.trim();
+            let name = name_part.split_once(':')?.0.trim();
+            if name.is_empty() {
+                None
+            } else {
+                Some(name.to_string())
+            }
+        })
+        .collect();
+    ifaces.sort();
+    ifaces.dedup();
+    ifaces
+}
+
+/// 动态检测 host 网络模式的容器进程 UID（无硬编码）
+///
+/// 原理：遍历 /proc，找到满足以下条件的进程：
+/// 1. 网络命名空间与宿主机一致（host 网络模式）
+/// 2. cgroup 属于容器（docker / containerd / podman）
+/// 3. UID 非 0（root 不需要排除）
+fn detect_exclude_uids() -> Vec<u32> {
+    let host_netns = match fs::read_link("/proc/1/ns/net") {
+        Ok(p) => p,
+        Err(_) => return Vec::new(),
+    };
+    let proc_dir = match fs::read_dir("/proc") {
+        Ok(d) => d,
+        Err(_) => return Vec::new(),
+    };
+    let mut uids = Vec::new();
+    for entry in proc_dir.flatten() {
+        let name = entry.file_name();
+        let name_str = name.to_string_lossy();
+        if !name_str.chars().all(|c| c.is_ascii_digit()) {
+            continue;
+        }
+        let pid_path = entry.path();
+        // 检查网络命名空间是否与宿主机一致
+        let proc_netns = match fs::read_link(pid_path.join("ns/net")) {
+            Ok(p) => p,
+            Err(_) => continue,
+        };
+        if proc_netns != host_netns {
+            continue;
+        }
+        // 检查是否在容器中（cgroup 包含容器标识）
+        let cgroup = match fs::read_to_string(pid_path.join("cgroup")) {
+            Ok(c) => c,
+            Err(_) => continue,
+        };
+        let in_container = cgroup.contains("docker")
+            || cgroup.contains("containerd")
+            || cgroup.contains("podman")
+            || cgroup.contains("/lxc/");
+        if !in_container {
+            continue;
+        }
+        // 读取 UID
+        let status = match fs::read_to_string(pid_path.join("status")) {
+            Ok(s) => s,
+            Err(_) => continue,
+        };
+        for line in status.lines() {
+            if let Some(rest) = line.strip_prefix("Uid:") {
+                if let Some(uid_str) = rest.trim().split_whitespace().next() {
+                    if let Ok(uid) = uid_str.parse::<u32>() {
+                        if uid != 0 {
+                            uids.push(uid);
+                        }
+                    }
+                }
+                break;
+            }
+        }
+    }
+    uids.sort();
+    uids.dedup();
+    uids
 }
 
 fn command_exists(binary: &str) -> bool {
