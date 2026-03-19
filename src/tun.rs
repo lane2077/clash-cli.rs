@@ -300,6 +300,8 @@ fn cmd_on(args: TunApplyArgs) -> Result<()> {
     set_bool_field(&mut root, &[], "ipv6", false);
     set_bool_field(&mut root, &["dns"], "ipv6", false);
     set_default_string_field(&mut root, &["dns"], "enhanced-mode", "fake-ip");
+    // dns-hijack 确保系统 DNS 请求被 mihomo 接管，fake-ip 模式必需。
+    set_default_sequence_field(&mut root, &["tun"], "dns-hijack", &["any:53".to_string()]);
     set_default_u16_field(&mut root, &[], "redir-port", DEFAULT_REDIR_PORT);
 
     // 动态检测物理网卡，使用 include-interface 白名单（比 exclude-interface 更安全）
@@ -1495,6 +1497,15 @@ fn set_default_u16_field(root: &mut Value, path_keys: &[&str], key: &str, value:
     let key_v = Value::String(key.to_string());
     if !map.contains_key(&key_v) {
         map.insert(key_v, Value::Number(Number::from(value as i64)));
+    }
+}
+
+fn set_default_sequence_field(root: &mut Value, path_keys: &[&str], key: &str, values: &[String]) {
+    let map = ensure_mapping_path(root, path_keys);
+    let key_v = Value::String(key.to_string());
+    if !map.contains_key(&key_v) {
+        let seq: Vec<Value> = values.iter().map(|v| Value::String(v.clone())).collect();
+        map.insert(key_v, Value::Sequence(seq));
     }
 }
 
