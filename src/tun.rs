@@ -177,19 +177,12 @@ fn cmd_doctor() -> Result<()> {
     checks.extend(config_checks);
 
     if config_tun_enable && config_auto_redirect {
-        let active_backend = detect_active_rule_backend();
-        if active_backend == RuleBackend::None {
-            checks.push(warn(
-                "数据面规则",
-                "配置要求 auto-redirect，但当前未检测到本工具管理的规则",
-                "可执行 `clash tun on` 重新下发规则",
-            ));
-        } else {
-            checks.push(pass(
-                "数据面规则",
-                &format!("检测到 {} 规则已存在", active_backend.as_str()),
-            ));
-        }
+        // auto-redirect 由 mihomo 自行管理 nft 规则，
+        // 只需确认服务正在运行即可。
+        checks.push(pass(
+            "数据面规则",
+            "auto-redirect=true，由 mihomo 自行管理数据面规则",
+        ));
     }
 
     let (pass_count, warn_count, fail_count) = if is_json_mode() {
@@ -253,7 +246,6 @@ fn cmd_on(args: TunApplyArgs) -> Result<()> {
 
     let paths = app_paths()?;
     let mut root = load_or_init_config(&paths.runtime_config_file)?;
-    let original_root = root.clone();
 
     set_bool_field(&mut root, &["tun"], "enable", true);
     set_default_bool_field(&mut root, &["tun"], "auto-route", true);
@@ -274,40 +266,21 @@ fn cmd_on(args: TunApplyArgs) -> Result<()> {
 
     save_config(&paths.runtime_config_file, &root)?;
 
-    let (backend, rules_applied) = if auto_redirect {
-        let preferred_backend = select_rule_backend()?;
-        let backend = match apply_dataplane_rules(preferred_backend, redir_port) {
-            Ok(actual_backend) => actual_backend,
-            Err(err) => {
-                save_config(&paths.runtime_config_file, &original_root)?;
-                if json_mode {
-                    return print_json(&serde_json::json!({
-                        "ok": false,
-                        "action": "tun.on",
-                        "error": err.to_string(),
-                        "rolled_back": true
-                    }));
-                }
-                eprintln!("错误: 下发数据面规则失败: {}", err);
-                eprintln!("已回滚 tun 配置到启用前状态。");
-                bail!("tun 开启失败");
-            }
-        };
-        if !json_mode {
+    // mihomo 在 auto-redirect=true 时自行管理 nft 规则，
+    // clash CLI 不再自建规则，避免双表冲突。
+    // 无论 auto_redirect 与否，都清理可能存在的历史自建规则。
+    cleanup_dataplane_rules_all_best_effort();
+    if !json_mode {
+        if auto_redirect {
             println!(
-                "已下发 {} 数据面规则，redir-port={}",
-                backend.as_str(),
-                redir_port
+                "已配置 auto-redirect=true，mihomo 将自行管理数据面规则"
             );
-        }
-        (backend, true)
-    } else {
-        cleanup_dataplane_rules_all_best_effort();
-        if !json_mode {
+        } else {
             println!("检测到 tun.auto-redirect=false，已跳过规则下发。");
         }
-        (RuleBackend::None, false)
-    };
+    }
+    let backend = RuleBackend::None;
+    let rules_applied = false;
 
     write_tun_state(
         &paths.runtime_tun_state_file,
@@ -436,7 +409,7 @@ fn cmd_status(args: TunStatusArgs) -> Result<()> {
     let tun = key_value(&root, "tun");
     let dns = key_value(&root, "dns");
     let tun_enable = bool_field(tun, "enable").unwrap_or(false);
-    let auto_redirect = bool_field(tun, "auto-redirect").unwrap_or(false);
+    let _auto_redirect = bool_field(tun, "auto-redirect").unwrap_or(false);
     let redir_port = u16_field(Some(&root), "redir-port").unwrap_or(DEFAULT_REDIR_PORT);
 
     if !is_json_mode() {
@@ -472,7 +445,8 @@ fn cmd_status(args: TunStatusArgs) -> Result<()> {
     let backend_installed = command_exists("nft") || command_exists("iptables");
     let active_backend = detect_active_rule_backend();
     let rules_active = active_backend != RuleBackend::None;
-    let redirect_ready = if auto_redirect { rules_active } else { true };
+    // auto-redirect 由 mihomo 管理，不再检查自建规则是否存在
+    let redirect_ready = true;
     let service_active = query_service_active(&args.name, args.user).unwrap_or(false);
     let last_state = read_tun_state(&paths.runtime_tun_state_file)?;
     let actual_ok = tun_enable && device_ok && redirect_ready && service_active;
@@ -785,6 +759,7 @@ fn check_config(config_path: &Path) -> (Vec<CheckItem>, bool, bool) {
     (items, tun_enable, auto_redirect)
 }
 
+#[allow(dead_code)]
 fn select_rule_backend() -> Result<RuleBackend> {
     if command_exists("nft") {
         return Ok(RuleBackend::Nft);
@@ -805,6 +780,7 @@ fn detect_active_rule_backend() -> RuleBackend {
     RuleBackend::None
 }
 
+#[allow(dead_code)]
 fn apply_dataplane_rules(backend: RuleBackend, redir_port: u16) -> Result<RuleBackend> {
     match backend {
         RuleBackend::Nft => match apply_nft_rules(redir_port) {
@@ -860,6 +836,7 @@ fn cleanup_dataplane_rules_all_best_effort() {
     }
 }
 
+#[allow(dead_code)]
 fn apply_nft_rules(redir_port: u16) -> Result<()> {
     if !command_exists("nft") {
         bail!("未检测到 nft 命令");
@@ -870,6 +847,9 @@ fn apply_nft_rules(redir_port: u16) -> Result<()> {
         "table inet {table} {{
   chain prerouting {{
     type nat hook prerouting priority dstnat; policy accept;
+    iifname \"br-*\" return
+    iifname \"docker*\" return
+    iifname \"veth*\" return
     ip daddr {{ 127.0.0.0/8, 10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16, 198.18.0.0/15, 224.0.0.0/4, 240.0.0.0/4 }} return
     ip6 daddr {{ ::1/128, fc00::/7, fe80::/10, ff00::/8 }} return
     tcp dport {{ 7890, 7891, 9090, {port} }} return
@@ -878,6 +858,7 @@ fn apply_nft_rules(redir_port: u16) -> Result<()> {
   chain output {{
     type nat hook output priority -100; policy accept;
     meta skuid 0 return
+    meta skuid 65532 return
     ip daddr {{ 127.0.0.0/8, 10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16, 198.18.0.0/15, 224.0.0.0/4, 240.0.0.0/4 }} return
     ip6 daddr {{ ::1/128, fc00::/7, fe80::/10, ff00::/8 }} return
     tcp dport {{ 7890, 7891, 9090, {port} }} return
@@ -904,6 +885,7 @@ fn cleanup_nft_rules() -> Result<()> {
     Ok(())
 }
 
+#[allow(dead_code)]
 fn apply_iptables_rules(redir_port: u16) -> Result<()> {
     if !command_exists("iptables") {
         bail!("未检测到 iptables 命令");
@@ -922,6 +904,7 @@ fn cleanup_iptables_rules() -> Result<()> {
     Ok(())
 }
 
+#[allow(dead_code)]
 fn configure_iptables_binary(binary: &str, redir_port: u16, optional: bool) -> Result<()> {
     if !command_exists(binary) {
         if optional {
@@ -1022,6 +1005,7 @@ fn configure_iptables_binary(binary: &str, redir_port: u16, optional: bool) -> R
     Ok(())
 }
 
+#[allow(dead_code)]
 fn ensure_iptables_jump(binary: &str, hook: &str, non_root_only: bool) -> Result<()> {
     if non_root_only {
         if !check_cmd_success(
