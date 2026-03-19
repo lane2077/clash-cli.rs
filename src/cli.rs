@@ -7,7 +7,7 @@ const DEFAULT_SERVICE_NAME: &str = "clash-mihomo";
 const DEFAULT_PROFILE_NAME: &str = "main";
 
 #[derive(Parser)]
-#[command(name = "clash", about = "面向 Linux 的 Clash 命令行工具")]
+#[command(name = "clash", version, about = "面向 Linux 的 Clash 命令行工具")]
 pub struct Cli {
     #[arg(long, global = true, help = "以 JSON 格式输出")]
     pub json: bool,
