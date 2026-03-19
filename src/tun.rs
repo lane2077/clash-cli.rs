@@ -304,12 +304,13 @@ fn cmd_on(args: TunApplyArgs) -> Result<()> {
     set_default_sequence_field(&mut root, &["tun"], "dns-hijack", &["any:53".to_string()]);
     set_default_u16_field(&mut root, &[], "redir-port", DEFAULT_REDIR_PORT);
 
-    // 动态检测物理网卡，使用 include-interface 白名单（比 exclude-interface 更安全）
-    let default_iface = detect_default_interface();
-    if let Some(ref iface) = default_iface {
-        set_sequence_field(&mut root, &["tun"], "include-interface", &[iface.clone()]);
+    // 动态检测 Docker 桥接接口，使用 exclude-interface 排除
+    // 注意：不用 include-interface，它会干扰 mihomo 自身的出站路由
+    let bridge_ifaces = detect_bridge_interfaces();
+    if !bridge_ifaces.is_empty() {
+        set_sequence_field(&mut root, &["tun"], "exclude-interface", &bridge_ifaces);
         if !json_mode {
-            println!("已检测到默认出口网卡: {}，仅代理该接口流量", iface);
+            println!("已排除桥接接口: {}", bridge_ifaces.join(", "));
         }
     }
     // 检测需要排除的 UID（cloudflared 等服务进程）
@@ -1542,28 +1543,6 @@ fn set_u32_sequence_field(root: &mut Value, path_keys: &[&str], key: &str, value
         .collect();
     ensure_mapping_path(root, path_keys)
         .insert(Value::String(key.to_string()), Value::Sequence(seq));
-}
-
-/// 检测默认路由出口网卡
-fn detect_default_interface() -> Option<String> {
-    let output = Command::new("ip")
-        .args(&["route", "show", "default"])
-        .output()
-        .ok()?;
-    if !output.status.success() {
-        return None;
-    }
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    // 格式: "default via 1.2.3.4 dev eth0 ..."
-    for line in stdout.lines() {
-        let parts: Vec<&str> = line.split_whitespace().collect();
-        if let Some(dev_idx) = parts.iter().position(|&p| p == "dev") {
-            if let Some(iface) = parts.get(dev_idx + 1) {
-                return Some(iface.to_string());
-            }
-        }
-    }
-    None
 }
 
 /// 检测系统中的桥接网络接口（Docker bridge 等），用于 doctor 诊断
