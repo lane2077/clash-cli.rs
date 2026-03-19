@@ -316,7 +316,7 @@ fn cmd_on(args: TunApplyArgs) -> Result<()> {
     let excluded_uids = detect_exclude_uids();
     if !excluded_uids.is_empty() {
         let uid_values: Vec<String> = excluded_uids.iter().map(|u| u.to_string()).collect();
-        set_sequence_field(&mut root, &["tun"], "exclude-uid", &uid_values);
+        set_u32_sequence_field(&mut root, &["tun"], "exclude-uid", &excluded_uids);
         if !json_mode {
             println!("已检测到排除 UID: {}", uid_values.join(", "));
         }
@@ -1531,6 +1531,15 @@ fn ensure_mapping_path<'a>(root: &'a mut Value, path_keys: &[&str]) -> &'a mut M
 
 fn set_sequence_field(root: &mut Value, path_keys: &[&str], key: &str, values: &[String]) {
     let seq: Vec<Value> = values.iter().map(|v| Value::String(v.clone())).collect();
+    ensure_mapping_path(root, path_keys)
+        .insert(Value::String(key.to_string()), Value::Sequence(seq));
+}
+
+fn set_u32_sequence_field(root: &mut Value, path_keys: &[&str], key: &str, values: &[u32]) {
+    let seq: Vec<Value> = values
+        .iter()
+        .map(|v| Value::Number(Number::from(*v as i64)))
+        .collect();
     ensure_mapping_path(root, path_keys)
         .insert(Value::String(key.to_string()), Value::Sequence(seq));
 }
