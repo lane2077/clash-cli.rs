@@ -304,19 +304,9 @@ fn cmd_on(args: TunApplyArgs) -> Result<()> {
     set_default_sequence_field(&mut root, &["tun"], "dns-hijack", &["any:53".to_string()]);
     set_default_u16_field(&mut root, &[], "redir-port", DEFAULT_REDIR_PORT);
 
-    // 动态检测 Docker 桥接接口，使用 exclude-interface 排除
-    // 注意：不用 include-interface，它会干扰 mihomo 自身的出站路由
-    // 清理可能残留的 include-interface（两者互斥）
+    // mihomo 的 auto-redirect 自己能正确处理 Docker 流量，不需要接口排除
     remove_tun_key(&mut root, "include-interface");
-    let bridge_ifaces = detect_bridge_interfaces();
-    if !bridge_ifaces.is_empty() {
-        set_sequence_field(&mut root, &["tun"], "exclude-interface", &bridge_ifaces);
-        if !json_mode {
-            println!("已排除桥接接口: {}", bridge_ifaces.join(", "));
-        }
-    } else {
-        remove_tun_key(&mut root, "exclude-interface");
-    }
+    remove_tun_key(&mut root, "exclude-interface");
     // 检测需要排除的 UID（cloudflared 等服务进程）
     let excluded_uids = detect_exclude_uids();
     if !excluded_uids.is_empty() {
@@ -1542,12 +1532,6 @@ fn remove_tun_key(root: &mut Value, key: &str) {
     {
         tun.remove(Value::String(key.to_string()));
     }
-}
-
-fn set_sequence_field(root: &mut Value, path_keys: &[&str], key: &str, values: &[String]) {
-    let seq: Vec<Value> = values.iter().map(|v| Value::String(v.clone())).collect();
-    ensure_mapping_path(root, path_keys)
-        .insert(Value::String(key.to_string()), Value::Sequence(seq));
 }
 
 fn set_u32_sequence_field(root: &mut Value, path_keys: &[&str], key: &str, values: &[u32]) {
