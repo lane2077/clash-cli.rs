@@ -153,10 +153,8 @@ fn cmd_uninstall(args: ServiceUninstallArgs) -> Result<()> {
         if !is_json_mode() {
             println!("已删除 unit: {}", unit_path.display());
         }
-    } else {
-        if !is_json_mode() {
-            println!("unit 不存在，无需删除: {}", unit_path.display());
-        }
+    } else if !is_json_mode() {
+        println!("unit 不存在，无需删除: {}", unit_path.display());
     }
 
     run_systemctl_raw(args.target.user, &["daemon-reload".to_string()])?;
@@ -174,13 +172,11 @@ fn cmd_uninstall(args: ServiceUninstallArgs) -> Result<()> {
             if !is_json_mode() {
                 println!("已清理 runtime 目录: {}", paths.runtime_dir.display());
             }
-        } else {
-            if !is_json_mode() {
-                println!(
-                    "runtime 目录不存在，无需清理: {}",
-                    paths.runtime_dir.display()
-                );
-            }
+        } else if !is_json_mode() {
+            println!(
+                "runtime 目录不存在，无需清理: {}",
+                paths.runtime_dir.display()
+            );
         }
     }
 
@@ -227,10 +223,7 @@ fn cmd_status(target: ServiceTargetArgs) -> Result<()> {
     ensure_linux_host()?;
     let unit = normalize_unit_name(&target.name);
 
-    let mut args = Vec::new();
-    args.push("status".to_string());
-    args.push(unit);
-    args.push("--no-pager".to_string());
+    let args = vec!["status".to_string(), unit, "--no-pager".to_string()];
     let output = run_systemctl_raw(target.user, &args)?;
     if is_json_mode() {
         return print_json(&serde_json::json!({
@@ -304,10 +297,10 @@ fn run_systemctl_unit_action(target: &ServiceTargetArgs, action: &str) -> Result
 }
 
 fn run_systemctl_unit_action_best_effort(target: &ServiceTargetArgs, action: &str, msg: &str) {
-    if let Err(err) = run_systemctl_unit_action(target, action) {
-        if !is_json_mode() {
-            eprintln!("警告: {}: {}", msg, err);
-        }
+    if let Err(err) = run_systemctl_unit_action(target, action)
+        && !is_json_mode()
+    {
+        eprintln!("警告: {}: {}", msg, err);
     }
 }
 

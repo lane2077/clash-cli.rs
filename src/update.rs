@@ -67,21 +67,19 @@ fn cmd_update(mirror: MirrorSource) -> Result<()> {
     let current_exe = env::current_exe().context("获取当前可执行文件路径失败")?;
 
     // 检查是否需要 sudo
-    if needs_sudo(&current_exe) {
-        if auto_sudo::should_auto_delegate(is_json_mode()) {
-            if !is_json_mode() {
-                println!("检测到权限不足，正在请求 sudo 授权继续执行 update ...");
-            }
-            let status = auto_sudo::run_with_sudo(is_json_mode(), |cmd| {
-                cmd.arg("update").arg("run");
-                cmd.arg("--mirror").arg(mirror_str(mirror));
-                Ok(())
-            })?;
-            if status.success() {
-                return Ok(());
-            }
-            bail!("sudo 授权未通过或命令执行失败，请手动使用 sudo 重试");
+    if needs_sudo(&current_exe) && auto_sudo::should_auto_delegate(is_json_mode()) {
+        if !is_json_mode() {
+            println!("检测到权限不足，正在请求 sudo 授权继续执行 update ...");
         }
+        let status = auto_sudo::run_with_sudo(is_json_mode(), |cmd| {
+            cmd.arg("update").arg("run");
+            cmd.arg("--mirror").arg(mirror_str(mirror));
+            Ok(())
+        })?;
+        if status.success() {
+            return Ok(());
+        }
+        bail!("sudo 授权未通过或命令执行失败，请手动使用 sudo 重试");
     }
 
     let current = current_version();

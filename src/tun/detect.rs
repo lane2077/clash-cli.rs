@@ -79,12 +79,11 @@ pub(super) fn detect_exclude_uids() -> Vec<u32> {
         };
         for line in status.lines() {
             if let Some(rest) = line.strip_prefix("Uid:") {
-                if let Some(uid_str) = rest.trim().split_whitespace().next() {
-                    if let Ok(uid) = uid_str.parse::<u32>() {
-                        if uid != 0 {
-                            uids.push(uid);
-                        }
-                    }
+                if let Some(uid_str) = rest.split_whitespace().next()
+                    && let Ok(uid) = uid_str.parse::<u32>()
+                    && uid != 0
+                {
+                    uids.push(uid);
                 }
                 break;
             }

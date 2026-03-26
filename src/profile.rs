@@ -117,7 +117,12 @@ fn cmd_list() -> Result<()> {
     let index = load_index(&paths.profile_index_file)?;
 
     if is_json_mode() {
-        return print_json(&index);
+        return print_json(&serde_json::json!({
+            "ok": true,
+            "action": "profile.list",
+            "active": index.active,
+            "profiles": index.profiles
+        }));
     }
 
     if index.profiles.is_empty() {
@@ -227,20 +232,22 @@ fn cmd_fetch(args: ProfileFetchArgs) -> Result<()> {
             .context("profile 不存在")?;
 
         let profile_path = paths.profile_dir.join(&profile.file);
-        if !args.force && profile.updated_at.is_some() && profile_path.exists() {
-            if utils::now_unix().saturating_sub(profile.updated_at.unwrap_or(0)) < 60 {
-                if is_json_mode() {
-                    return print_json(&serde_json::json!({
-                        "ok": true,
-                        "action": "profile.fetch",
-                        "name": args.name,
-                        "skipped": true,
-                        "reason": "recently updated",
-                    }));
-                }
-                println!("最近 60 秒内已更新，跳过拉取。可加 --force 强制更新。");
-                return Ok(());
+        if !args.force
+            && profile.updated_at.is_some()
+            && profile_path.exists()
+            && utils::now_unix().saturating_sub(profile.updated_at.unwrap_or(0)) < 60
+        {
+            if is_json_mode() {
+                return print_json(&serde_json::json!({
+                    "ok": true,
+                    "action": "profile.fetch",
+                    "name": args.name,
+                    "skipped": true,
+                    "reason": "recently updated",
+                }));
             }
+            println!("最近 60 秒内已更新，跳过拉取。可加 --force 强制更新。");
+            return Ok(());
         }
 
         fetch_profile_entry(profile, &paths.profile_dir, args.force)?;
@@ -671,19 +678,18 @@ fn print_profile_home_hint(paths: &AppPaths) {
     println!("当前配置目录: {}", paths.config_dir.display());
     if let Ok(Some(service_runtime_config)) =
         detect_service_runtime_config_path(constants::DEFAULT_SYSTEM_SERVICE_UNIT)
+        && !path_eq(&service_runtime_config, &paths.runtime_config_file)
     {
-        if !path_eq(&service_runtime_config, &paths.runtime_config_file) {
+        println!(
+            "提示: {} 当前使用配置: {}",
+            constants::DEFAULT_SYSTEM_SERVICE_UNIT,
+            service_runtime_config.display()
+        );
+        if let Some(home) = infer_home_from_runtime_config(&service_runtime_config) {
             println!(
-                "提示: {} 当前使用配置: {}",
-                constants::DEFAULT_SYSTEM_SERVICE_UNIT,
-                service_runtime_config.display()
+                "如需管理该服务，请使用: sudo env CLASH_CLI_HOME={} clash profile list",
+                home.display()
             );
-            if let Some(home) = infer_home_from_runtime_config(&service_runtime_config) {
-                println!(
-                    "如需管理该服务，请使用: sudo env CLASH_CLI_HOME={} clash profile list",
-                    home.display()
-                );
-            }
         }
     }
 }

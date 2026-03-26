@@ -183,12 +183,11 @@ fn cmd_unify(args: SetupUnifyArgs) -> Result<()> {
         }
     }
 
-    if index.active.is_none() {
-        if let Some(active) = candidate_active {
-            if index.profiles.iter().any(|p| p.name == active) {
-                index.active = Some(active);
-            }
-        }
+    if index.active.is_none()
+        && let Some(active) = candidate_active
+        && index.profiles.iter().any(|p| p.name == active)
+    {
+        index.active = Some(active);
     }
     if index.active.is_none() && !index.profiles.is_empty() {
         index.active = Some(index.profiles[0].name.clone());
@@ -407,13 +406,14 @@ fn amd64_variant_str(v: Amd64Variant) -> &'static str {
 fn discover_source_config_dirs(dest_dir: &Path) -> Result<Vec<PathBuf>> {
     let mut result = Vec::<PathBuf>::new();
 
-    if let Ok(user) = env::var("SUDO_USER") {
-        if !user.is_empty() && user != "root" {
-            if let Some(home) = lookup_home_by_user(&user)? {
-                result.push(home.join(".config").join("clash-cli"));
-            } else {
-                result.push(PathBuf::from(format!("/home/{user}/.config/clash-cli")));
-            }
+    if let Ok(user) = env::var("SUDO_USER")
+        && !user.is_empty()
+        && user != "root"
+    {
+        if let Some(home) = lookup_home_by_user(&user)? {
+            result.push(home.join(".config").join("clash-cli"));
+        } else {
+            result.push(PathBuf::from(format!("/home/{user}/.config/clash-cli")));
         }
     }
 

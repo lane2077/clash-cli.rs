@@ -167,6 +167,22 @@ pub enum ApiCommand {
     Connections(ApiCommonArgs),
     #[command(about = "输出 Dashboard 访问地址（含 controller/ui 元信息）")]
     UiUrl(ApiCommonArgs),
+    #[command(about = "查看当前规则列表")]
+    Rules(ApiCommonArgs),
+    #[command(about = "查看运行配置")]
+    Configs(ApiCommonArgs),
+    #[command(about = "查看代理 Provider 列表")]
+    Providers(ApiCommonArgs),
+    #[command(about = "切换代理组中的节点", name = "proxy-switch")]
+    ProxySwitch(ApiProxySwitchArgs),
+    #[command(about = "关闭所有活跃连接", name = "close-connections")]
+    CloseConnections(ApiCommonArgs),
+    #[command(about = "PATCH 修改运行配置", name = "config-patch")]
+    ConfigPatch(ApiConfigPatchArgs),
+    #[command(about = "获取当前流量快照")]
+    Traffic(ApiCommonArgs),
+    #[command(about = "获取最近日志快照")]
+    Logs(ApiLogsArgs),
 }
 
 #[derive(Subcommand)]
@@ -261,6 +277,53 @@ pub struct ApiCommonArgs {
 pub struct ApiModeSetArgs {
     #[arg(value_enum, help = "目标模式")]
     pub mode: ApiModeValue,
+}
+
+#[derive(Args, Clone)]
+pub struct ApiProxySwitchArgs {
+    #[arg(long, help = "代理组名称")]
+    pub group: String,
+    #[arg(long, help = "目标代理节点名称")]
+    pub proxy: String,
+    #[command(flatten)]
+    pub common: ApiCommonArgs,
+}
+
+#[derive(Args, Clone)]
+pub struct ApiConfigPatchArgs {
+    #[arg(long, help = "JSON 格式 payload，例如 '{\"mode\":\"rule\"}'")]
+    pub data: String,
+    #[command(flatten)]
+    pub common: ApiCommonArgs,
+}
+
+#[derive(Args, Clone)]
+pub struct ApiLogsArgs {
+    #[arg(long, value_enum, help = "日志级别过滤")]
+    pub level: Option<LogLevel>,
+    #[command(flatten)]
+    pub common: ApiCommonArgs,
+}
+
+#[derive(Clone, Copy, Debug, ValueEnum)]
+pub enum LogLevel {
+    Debug,
+    Info,
+    Warning,
+    Error,
+    Silent,
+}
+
+impl LogLevel {
+    pub fn as_api_str(self) -> &'static str {
+        match self {
+            LogLevel::Debug => "debug",
+            LogLevel::Info => "info",
+            LogLevel::Warning => "warning",
+            LogLevel::Error => "error",
+            LogLevel::Silent => "silent",
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, ValueEnum)]

@@ -44,10 +44,10 @@ where
 
 pub fn is_permission_denied_error(err: &anyhow::Error) -> bool {
     for cause in err.chain() {
-        if let Some(io_err) = cause.downcast_ref::<std::io::Error>() {
-            if io_err.kind() == ErrorKind::PermissionDenied {
-                return true;
-            }
+        if let Some(io_err) = cause.downcast_ref::<std::io::Error>()
+            && io_err.kind() == ErrorKind::PermissionDenied
+        {
+            return true;
         }
     }
     let msg = err.to_string();

@@ -1,12 +1,15 @@
+use std::fmt::Write as _;
 use std::fs;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
-use reqwest::blocking::{Client, RequestBuilder};
+use reqwest::blocking::{Client, RequestBuilder, Response};
 use serde_json::Value as JsonValue;
 use serde_yaml::Value as YamlValue;
 
-use crate::cli::{ApiCommand, ApiCommonArgs, ApiModeCommand};
+use crate::cli::{
+    ApiCommand, ApiCommonArgs, ApiConfigPatchArgs, ApiLogsArgs, ApiModeCommand, ApiProxySwitchArgs,
+};
 use crate::constants;
 use crate::output::{is_json_mode, print_json};
 use crate::paths::app_paths;
@@ -24,6 +27,14 @@ pub fn run(command: ApiCommand) -> Result<()> {
         ApiCommand::Proxies(common) => cmd_proxies(common),
         ApiCommand::Connections(common) => cmd_connections(common),
         ApiCommand::UiUrl(common) => cmd_ui_url(common),
+        ApiCommand::Rules(common) => cmd_rules(common),
+        ApiCommand::Configs(common) => cmd_configs(common),
+        ApiCommand::Providers(common) => cmd_providers(common),
+        ApiCommand::ProxySwitch(args) => cmd_proxy_switch(args),
+        ApiCommand::CloseConnections(common) => cmd_close_connections(common),
+        ApiCommand::ConfigPatch(args) => cmd_config_patch(args),
+        ApiCommand::Traffic(common) => cmd_traffic(common),
+        ApiCommand::Logs(args) => cmd_logs(args),
     }
 }
 
@@ -264,24 +275,37 @@ fn build_dashboard_url(controller: &str) -> String {
 }
 
 fn apply_secret(req: RequestBuilder, ctx: &ApiContext) -> RequestBuilder {
-    if let Some(secret) = &ctx.secret {
-        if !secret.is_empty() {
-            return req.header("Authorization", format!("Bearer {}", secret));
-        }
+    if let Some(secret) = &ctx.secret
+        && !secret.is_empty()
+    {
+        return req.header("Authorization", format!("Bearer {}", secret));
     }
     req
 }
 
-fn api_get(client: &Client, ctx: &ApiContext, path: &str) -> Result<JsonValue> {
-    let url = format!("{}{}", ctx.base_url, path);
-    let req = apply_secret(client.get(&url), ctx);
+fn send_and_parse(req: RequestBuilder, url: &str) -> Result<JsonValue> {
     let resp = req
         .send()
         .with_context(|| format!("请求失败: {}", url))?
         .error_for_status()
         .with_context(|| format!("请求返回非成功状态: {}", url))?;
-    resp.json::<JsonValue>()
-        .with_context(|| format!("解析响应失败: {}", url))
+    parse_response(resp, url)
+}
+
+fn parse_response(resp: Response, url: &str) -> Result<JsonValue> {
+    let text = resp
+        .text()
+        .with_context(|| format!("读取响应失败: {}", url))?;
+    if text.is_empty() {
+        Ok(serde_json::json!(null))
+    } else {
+        serde_json::from_str(&text).with_context(|| format!("解析响应失败: {}", url))
+    }
+}
+
+fn api_get(client: &Client, ctx: &ApiContext, path: &str) -> Result<JsonValue> {
+    let url = format!("{}{}", ctx.base_url, path);
+    send_and_parse(apply_secret(client.get(&url), ctx), &url)
 }
 
 fn api_patch(
@@ -291,14 +315,263 @@ fn api_patch(
     payload: JsonValue,
 ) -> Result<JsonValue> {
     let url = format!("{}{}", ctx.base_url, path);
-    let req = apply_secret(client.patch(&url).json(&payload), ctx);
-    let resp = req
+    send_and_parse(apply_secret(client.patch(&url).json(&payload), ctx), &url)
+}
+
+fn api_put(client: &Client, ctx: &ApiContext, path: &str, payload: JsonValue) -> Result<JsonValue> {
+    let url = format!("{}{}", ctx.base_url, path);
+    send_and_parse(apply_secret(client.put(&url).json(&payload), ctx), &url)
+}
+
+fn api_delete(client: &Client, ctx: &ApiContext, path: &str) -> Result<JsonValue> {
+    let url = format!("{}{}", ctx.base_url, path);
+    send_and_parse(apply_secret(client.delete(&url), ctx), &url)
+}
+
+fn cmd_rules(common: ApiCommonArgs) -> Result<()> {
+    let client = build_client(common.timeout_secs)?;
+    let ctx = load_api_context(&common)?;
+    let response = api_get(&client, &ctx, "/rules")?;
+
+    if is_json_mode() {
+        return print_json(&serde_json::json!({
+            "ok": true,
+            "action": "api.rules",
+            "response": response
+        }));
+    }
+
+    let empty = vec![];
+    let rules = response
+        .get("rules")
+        .and_then(|v| v.as_array())
+        .unwrap_or(&empty);
+    println!("规则总数: {}", rules.len());
+    let mut type_counts = std::collections::HashMap::new();
+    for rule in rules {
+        if let Some(t) = rule.get("type").and_then(|v| v.as_str()) {
+            *type_counts.entry(t.to_string()).or_insert(0u64) += 1;
+        }
+    }
+    for (t, count) in &type_counts {
+        println!("  {}: {}", t, count);
+    }
+    Ok(())
+}
+
+fn cmd_configs(common: ApiCommonArgs) -> Result<()> {
+    let client = build_client(common.timeout_secs)?;
+    let ctx = load_api_context(&common)?;
+    let response = api_get(&client, &ctx, "/configs")?;
+
+    if is_json_mode() {
+        return print_json(&serde_json::json!({
+            "ok": true,
+            "action": "api.configs",
+            "response": response
+        }));
+    }
+
+    for key in &[
+        "mode",
+        "port",
+        "socks-port",
+        "mixed-port",
+        "redir-port",
+        "tproxy-port",
+        "allow-lan",
+        "log-level",
+        "ipv6",
+    ] {
+        if let Some(v) = response.get(key) {
+            println!("{}: {}", key, v);
+        }
+    }
+    Ok(())
+}
+
+fn cmd_providers(common: ApiCommonArgs) -> Result<()> {
+    let client = build_client(common.timeout_secs)?;
+    let ctx = load_api_context(&common)?;
+    let response = api_get(&client, &ctx, "/providers/proxies")?;
+
+    if is_json_mode() {
+        return print_json(&serde_json::json!({
+            "ok": true,
+            "action": "api.providers",
+            "response": response
+        }));
+    }
+
+    let empty = serde_json::Map::new();
+    let providers = response
+        .get("providers")
+        .and_then(|v| v.as_object())
+        .unwrap_or(&empty);
+    println!("Provider 数量: {}", providers.len());
+    for (name, info) in providers {
+        let ptype = info
+            .get("type")
+            .and_then(|v| v.as_str())
+            .unwrap_or("unknown");
+        let count = info
+            .get("proxies")
+            .and_then(|v| v.as_array())
+            .map(|a| a.len())
+            .unwrap_or(0);
+        println!("  {} (type={}, proxies={})", name, ptype, count);
+    }
+    Ok(())
+}
+
+fn cmd_proxy_switch(args: ApiProxySwitchArgs) -> Result<()> {
+    let client = build_client(args.common.timeout_secs)?;
+    let ctx = load_api_context(&args.common)?;
+    let encoded_group = urlencoded(&args.group);
+    let path = format!("/proxies/{}", encoded_group);
+    let payload = serde_json::json!({ "name": args.proxy });
+    let response = api_put(&client, &ctx, &path, payload)?;
+
+    if is_json_mode() {
+        return print_json(&serde_json::json!({
+            "ok": true,
+            "action": "api.proxy-switch",
+            "group": args.group,
+            "proxy": args.proxy,
+            "response": response
+        }));
+    }
+
+    println!("已切换 [{}] -> {}", args.group, args.proxy);
+    Ok(())
+}
+
+fn cmd_close_connections(common: ApiCommonArgs) -> Result<()> {
+    let client = build_client(common.timeout_secs)?;
+    let ctx = load_api_context(&common)?;
+    let response = api_delete(&client, &ctx, "/connections")?;
+
+    if is_json_mode() {
+        return print_json(&serde_json::json!({
+            "ok": true,
+            "action": "api.close-connections",
+            "response": response
+        }));
+    }
+
+    println!("已关闭所有连接。");
+    Ok(())
+}
+
+fn cmd_config_patch(args: ApiConfigPatchArgs) -> Result<()> {
+    let payload: JsonValue =
+        serde_json::from_str(&args.data).context("--data 参数不是合法的 JSON")?;
+    let client = build_client(args.common.timeout_secs)?;
+    let ctx = load_api_context(&args.common)?;
+    let response = api_patch(&client, &ctx, "/configs", payload)?;
+
+    if is_json_mode() {
+        return print_json(&serde_json::json!({
+            "ok": true,
+            "action": "api.config-patch",
+            "response": response
+        }));
+    }
+
+    println!("配置已更新。");
+    Ok(())
+}
+
+fn cmd_traffic(common: ApiCommonArgs) -> Result<()> {
+    let client = build_client(3)?;
+    let ctx = load_api_context(&common)?;
+    let url = format!("{}/traffic", ctx.base_url);
+    let req = apply_secret(client.get(&url), &ctx);
+    let text = req
         .send()
         .with_context(|| format!("请求失败: {}", url))?
-        .error_for_status()
-        .with_context(|| format!("请求返回非成功状态: {}", url))?;
-    resp.json::<JsonValue>()
-        .with_context(|| format!("解析响应失败: {}", url))
+        .text()
+        .unwrap_or_default();
+
+    let snapshot = text
+        .lines()
+        .find_map(|line| serde_json::from_str::<JsonValue>(line).ok());
+
+    if is_json_mode() {
+        return print_json(&serde_json::json!({
+            "ok": true,
+            "action": "api.traffic",
+            "snapshot": snapshot
+        }));
+    }
+
+    match snapshot {
+        Some(s) => {
+            let up = s.get("up").and_then(|v| v.as_u64()).unwrap_or(0);
+            let down = s.get("down").and_then(|v| v.as_u64()).unwrap_or(0);
+            println!("上行: {} B/s", up);
+            println!("下行: {} B/s", down);
+        }
+        None => println!("未获取到流量数据。"),
+    }
+    Ok(())
+}
+
+fn cmd_logs(args: ApiLogsArgs) -> Result<()> {
+    let client = build_client(3)?;
+    let ctx = load_api_context(&args.common)?;
+    let url = match &args.level {
+        Some(level) => format!("{}/logs?level={}", ctx.base_url, level.as_api_str()),
+        None => format!("{}/logs", ctx.base_url),
+    };
+    let req = apply_secret(client.get(&url), &ctx);
+    let text = req
+        .send()
+        .with_context(|| format!("请求失败: {}", url))?
+        .text()
+        .unwrap_or_default();
+
+    let entries: Vec<JsonValue> = text
+        .lines()
+        .filter_map(|line| serde_json::from_str::<JsonValue>(line).ok())
+        .take(50)
+        .collect();
+
+    if is_json_mode() {
+        return print_json(&serde_json::json!({
+            "ok": true,
+            "action": "api.logs",
+            "count": entries.len(),
+            "entries": entries
+        }));
+    }
+
+    if entries.is_empty() {
+        println!("未获取到日志条目。");
+    } else {
+        println!("获取到 {} 条日志:", entries.len());
+        for entry in &entries {
+            let level = entry
+                .get("type")
+                .and_then(|v| v.as_str())
+                .unwrap_or("unknown");
+            let payload = entry.get("payload").and_then(|v| v.as_str()).unwrap_or("");
+            println!("[{}] {}", level, payload);
+        }
+    }
+    Ok(())
+}
+
+fn urlencoded(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() * 3);
+    for b in s.bytes() {
+        if b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.' | b'~') {
+            out.push(b as char);
+        } else {
+            let _ = write!(out, "%{:02X}", b);
+        }
+    }
+    out
 }
 
 #[cfg(test)]

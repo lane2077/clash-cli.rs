@@ -204,11 +204,11 @@ fn parse_yaml_value(raw: &str) -> Value {
             if let Ok(n) = raw.parse::<i64>() {
                 return Value::Number(serde_yaml::Number::from(n));
             }
-            if let Ok(f) = raw.parse::<f64>() {
-                if let Some(n) = serde_yaml::Number::from(f).as_f64() {
-                    let _ = n;
-                    return Value::Number(serde_yaml::Number::from(f));
-                }
+            if let Ok(f) = raw.parse::<f64>()
+                && let Some(n) = serde_yaml::Number::from(f).as_f64()
+            {
+                let _ = n;
+                return Value::Number(serde_yaml::Number::from(f));
             }
             Value::String(raw.to_string())
         }
@@ -263,12 +263,11 @@ fn unset_recursive(current: &mut Value, segments: &[&str]) -> bool {
     if let Some(child) = mapping.get_mut(&key) {
         let removed = unset_recursive(child, &segments[1..]);
         // 如果子 mapping 空了，清理掉
-        if removed {
-            if let Some(m) = child.as_mapping() {
-                if m.is_empty() {
-                    mapping.remove(&key);
-                }
-            }
+        if removed
+            && let Some(m) = child.as_mapping()
+            && m.is_empty()
+        {
+            mapping.remove(&key);
         }
         removed
     } else {

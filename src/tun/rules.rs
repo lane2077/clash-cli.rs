@@ -42,10 +42,10 @@ pub(super) fn cleanup_dataplane_rules_all() -> Result<()> {
 }
 
 pub(super) fn cleanup_dataplane_rules_all_best_effort() {
-    if let Err(err) = cleanup_dataplane_rules_all() {
-        if !is_json_mode() {
-            eprintln!("警告: 清理历史规则失败: {}", err);
-        }
+    if let Err(err) = cleanup_dataplane_rules_all()
+        && !is_json_mode()
+    {
+        eprintln!("警告: 清理历史规则失败: {}", err);
     }
 }
 

@@ -86,13 +86,13 @@ pub(super) fn cmd_doctor() -> Result<()> {
             .and_then(|t| t.as_mapping())
             .and_then(|m| m.get(Value::String("include-interface".to_string())))
             .and_then(|v| v.as_sequence())
-            .map_or(false, |s| !s.is_empty());
+            .is_some_and(|s| !s.is_empty());
         let has_exclude = tun
             .as_ref()
             .and_then(|t| t.as_mapping())
             .and_then(|m| m.get(Value::String("exclude-interface".to_string())))
             .and_then(|v| v.as_sequence())
-            .map_or(false, |s| !s.is_empty());
+            .is_some_and(|s| !s.is_empty());
         if has_include || has_exclude {
             checks.push(pass(
                 "Docker 桥接隔离",
