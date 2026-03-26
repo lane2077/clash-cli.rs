@@ -1,9 +1,10 @@
 use std::env;
 use std::path::PathBuf;
-use std::process::Command;
 use std::sync::OnceLock;
 
 use anyhow::{Context, Result};
+
+use crate::utils;
 
 static HOME_OVERRIDE: OnceLock<PathBuf> = OnceLock::new();
 
@@ -35,7 +36,7 @@ pub fn app_paths() -> Result<AppPaths> {
         override_home.clone()
     } else if let Some(custom) = env::var_os("CLASH_CLI_HOME") {
         PathBuf::from(custom)
-    } else if is_root_user() {
+    } else if utils::is_root_user() {
         // Linux 服务场景下，root 默认统一使用系统目录，避免落到 /root/.config 造成双配置源。
         PathBuf::from("/etc/clash-cli")
     } else if let Some(xdg) = env::var_os("XDG_CONFIG_HOME") {
@@ -62,12 +63,4 @@ pub fn app_paths() -> Result<AppPaths> {
         core_meta_file: core_dir.join("current.meta"),
         core_dir,
     })
-}
-
-fn is_root_user() -> bool {
-    let output = Command::new("id").arg("-u").output();
-    match output {
-        Ok(v) if v.status.success() => String::from_utf8_lossy(&v.stdout).trim() == "0",
-        _ => false,
-    }
 }

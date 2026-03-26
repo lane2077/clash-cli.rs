@@ -12,7 +12,7 @@ pub fn build_http_client() -> Result<Client> {
     Client::builder()
         .timeout(Duration::from_secs(180))
         .connect_timeout(Duration::from_secs(20))
-        .user_agent("clash-cli/0.1")
+        .user_agent(format!("clash-cli/{}", env!("CARGO_PKG_VERSION")))
         .build()
         .context("创建 HTTP 客户端失败")
 }

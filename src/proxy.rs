@@ -8,14 +8,15 @@ use serde::Serialize;
 use serde_yaml::Value as YamlValue;
 
 use crate::cli::{AutoAction, EnvAction, ProxyCommand, ShellKind, StartArgs, StopArgs};
+use crate::constants;
 use crate::output::{is_json_mode, print_json};
 use crate::paths::app_paths;
 
 const HOOK_START: &str = "# >>> clash-cli proxy >>>";
 const HOOK_END: &str = "# <<< clash-cli proxy <<<";
-const DEFAULT_PROXY_HOST: &str = "127.0.0.1";
-const DEFAULT_HTTP_PORT: u16 = 7890;
-const DEFAULT_SOCKS_PORT: u16 = 7891;
+const DEFAULT_PROXY_HOST: &str = constants::DEFAULT_BIND_ADDRESS;
+const DEFAULT_HTTP_PORT: u16 = constants::DEFAULT_MIXED_PORT;
+const DEFAULT_SOCKS_PORT: u16 = constants::DEFAULT_SOCKS_PORT;
 const SHELL_HOOK_BODY: &str = r#"if [ -n "$CLASH_CLI_HOME" ] && [ -f "$CLASH_CLI_HOME/proxy.env" ]; then
   . "$CLASH_CLI_HOME/proxy.env"
 elif [ -n "$XDG_CONFIG_HOME" ] && [ -f "$XDG_CONFIG_HOME/clash-cli/proxy.env" ]; then

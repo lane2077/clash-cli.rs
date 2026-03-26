@@ -4,10 +4,8 @@ use std::fs;
 use std::os::unix::fs::{PermissionsExt, symlink};
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, bail};
-use serde::{Deserialize, Serialize};
 
 use crate::api;
 use crate::auto_sudo;
@@ -20,9 +18,10 @@ use crate::cli::{
 use crate::core;
 use crate::output::is_json_mode;
 use crate::paths::app_paths;
-use crate::profile;
+use crate::profile::{self, ProfileEntry, ProfileIndex, load_index, save_index};
 use crate::service;
 use crate::tun;
+use crate::utils;
 
 const DEFAULT_SYSTEM_HOME: &str = "/etc/clash-cli";
 
@@ -34,7 +33,7 @@ pub fn run(command: SetupCommand) -> Result<()> {
 }
 
 fn cmd_init(args: SetupInitArgs) -> Result<()> {
-    ensure_linux_host()?;
+    utils::ensure_linux_host()?;
     if ensure_setup_privileges_or_delegate(SetupAction::Init(&args))? == PrivilegeCheck::Delegated {
         return Ok(());
     }
@@ -68,7 +67,7 @@ fn cmd_init(args: SetupInitArgs) -> Result<()> {
     install_binary(&paths.core_current_link, &args.binary)?;
     println!("已安装 mihomo 到: {}", args.binary.display());
 
-    ensure_profile_ready(&args.profile_name, &args.profile_url)?;
+    ensure_profile_ready(&args.profile_name, &args.profile_url, &args.service_name)?;
     profile::run(ProfileCommand::Render(ProfileRenderArgs {
         name: Some(args.profile_name.clone()),
         output: None,
@@ -118,21 +117,6 @@ fn cmd_init(args: SetupInitArgs) -> Result<()> {
     Ok(())
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct ProfileEntry {
-    name: String,
-    url: String,
-    file: String,
-    created_at: u64,
-    updated_at: Option<u64>,
-}
-
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-struct ProfileIndex {
-    active: Option<String>,
-    profiles: Vec<ProfileEntry>,
-}
-
 #[derive(Default)]
 struct UnifyStats {
     imported: usize,
@@ -149,7 +133,7 @@ struct LinkStats {
 }
 
 fn cmd_unify(args: SetupUnifyArgs) -> Result<()> {
-    ensure_linux_host()?;
+    utils::ensure_linux_host()?;
     if ensure_setup_privileges_or_delegate(SetupAction::Unify(&args))? == PrivilegeCheck::Delegated
     {
         return Ok(());
@@ -163,7 +147,7 @@ fn cmd_unify(args: SetupUnifyArgs) -> Result<()> {
     let paths = app_paths()?;
     fs::create_dir_all(&paths.profile_dir).context("创建目标 profile 目录失败")?;
 
-    let mut index = load_profile_index(&paths.profile_index_file)?;
+    let mut index = load_index(&paths.profile_index_file)?;
     let mut stats = UnifyStats::default();
     let mut warnings = Vec::<String>::new();
     let source_dirs = discover_source_config_dirs(&paths.config_dir)?;
@@ -180,7 +164,7 @@ fn cmd_unify(args: SetupUnifyArgs) -> Result<()> {
         if !src_index_file.exists() {
             continue;
         }
-        let src_index = load_profile_index(&src_index_file)
+        let src_index = load_index(&src_index_file)
             .with_context(|| format!("读取来源 profile 索引失败: {}", src_index_file.display()))?;
         println!("发现来源目录: {}", src_dir.display());
         if candidate_active.is_none() {
@@ -210,7 +194,7 @@ fn cmd_unify(args: SetupUnifyArgs) -> Result<()> {
         index.active = Some(index.profiles[0].name.clone());
     }
 
-    save_profile_index(&paths.profile_index_file, &index)?;
+    save_index(&paths.profile_index_file, &index)?;
     println!(
         "收敛完成: imported={}, existed={}, conflicts={}, missing_files={}",
         stats.imported, stats.existed, stats.conflicts, stats.missing_files
@@ -255,7 +239,7 @@ fn cmd_unify(args: SetupUnifyArgs) -> Result<()> {
     Ok(())
 }
 
-fn ensure_profile_ready(name: &str, url: &str) -> Result<()> {
+fn ensure_profile_ready(name: &str, url: &str, service_name: &str) -> Result<()> {
     let add_result = profile::run(ProfileCommand::Add(ProfileAddArgs {
         name: name.to_string(),
         url: url.to_string(),
@@ -275,7 +259,7 @@ fn ensure_profile_ready(name: &str, url: &str) -> Result<()> {
                     name: name.to_string(),
                     apply: false,
                     fetch: false,
-                    service_name: "clash-mihomo".to_string(),
+                    service_name: service_name.to_string(),
                     no_restart: true,
                 }))?;
                 return Ok(());
@@ -300,50 +284,23 @@ fn install_binary(source: &Path, target: &Path) -> Result<()> {
         .with_context(|| format!("替换内核失败: {} -> {}", tmp.display(), target.display()))?;
 
     // SELinux 环境下尽量恢复上下文，失败不阻断。
-    if command_exists("restorecon") {
+    if utils::command_exists("restorecon") {
         let _ = Command::new("restorecon").arg("-v").arg(target).status();
     }
     Ok(())
-}
-
-fn command_exists(binary: &str) -> bool {
-    Command::new(binary)
-        .arg("--version")
-        .output()
-        .map(|o| o.status.success())
-        .unwrap_or(false)
 }
 
 fn trim_service_suffix(name: &str) -> String {
     name.strip_suffix(".service").unwrap_or(name).to_string()
 }
 
-fn ensure_linux_host() -> Result<()> {
-    if env::consts::OS != "linux" {
-        bail!("当前仅支持 Linux 平台");
-    }
-    Ok(())
-}
-
 fn ensure_root_user() -> Result<()> {
-    if !is_root_user()? {
+    if !utils::is_root_user() {
         bail!(
             "请使用 root 执行，例如: sudo env CLASH_CLI_HOME=/etc/clash-cli clash setup init --profile-url <URL>"
         );
     }
     Ok(())
-}
-
-fn is_root_user() -> Result<bool> {
-    let output = Command::new("id")
-        .arg("-u")
-        .output()
-        .context("检测当前用户失败")?;
-    if !output.status.success() {
-        bail!("检测当前用户失败: id -u 返回非成功状态");
-    }
-    let uid = String::from_utf8_lossy(&output.stdout).trim().to_string();
-    Ok(uid == "0")
 }
 
 fn ensure_setup_home_for_root() {
@@ -368,7 +325,7 @@ enum SetupAction<'a> {
 }
 
 fn ensure_setup_privileges_or_delegate(action: SetupAction<'_>) -> Result<PrivilegeCheck> {
-    if is_root_user().unwrap_or(false) {
+    if utils::is_root_user() {
         return Ok(PrivilegeCheck::Ok);
     }
     if !auto_sudo::should_auto_delegate(is_json_mode()) {
@@ -499,24 +456,6 @@ fn lookup_home_by_user(user: &str) -> Result<Option<PathBuf>> {
     Ok(Some(PathBuf::from(fields[5])))
 }
 
-fn load_profile_index(path: &Path) -> Result<ProfileIndex> {
-    if !path.exists() {
-        return Ok(ProfileIndex::default());
-    }
-    let content = fs::read_to_string(path)
-        .with_context(|| format!("读取 profile 索引失败: {}", path.display()))?;
-    serde_json::from_str(&content).context("解析 profile 索引失败")
-}
-
-fn save_profile_index(path: &Path, index: &ProfileIndex) -> Result<()> {
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)
-            .with_context(|| format!("创建目录失败: {}", parent.display()))?;
-    }
-    let content = serde_json::to_string_pretty(index).context("序列化 profile 索引失败")?;
-    fs::write(path, content).with_context(|| format!("写入 profile 索引失败: {}", path.display()))
-}
-
 fn merge_profile_entry(
     entry: &ProfileEntry,
     src_profile_dir: &Path,
@@ -641,7 +580,7 @@ fn build_backup_path(path: &Path) -> PathBuf {
     let base_name = path
         .file_name()
         .unwrap_or_else(|| std::ffi::OsStr::new("clash-cli"));
-    let ts = now_unix();
+    let ts = utils::now_unix();
     let mut idx: u32 = 0;
     loop {
         let mut name = OsString::from(base_name);
@@ -666,11 +605,4 @@ fn path_eq(a: &Path, b: &Path) -> bool {
         (Ok(x), Ok(y)) => x == y,
         _ => false,
     }
-}
-
-fn now_unix() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|v| v.as_secs())
-        .unwrap_or(0)
 }

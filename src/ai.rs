@@ -11,6 +11,7 @@ use crate::ai_protocol::{
 };
 use crate::ai_tools::{self, MihomoCtx};
 use crate::cli::{AiCommand, AiModelsArgs, AiRulesArgs};
+use crate::constants;
 use crate::output::{is_json_mode, print_json};
 use crate::paths::app_paths;
 
@@ -77,11 +78,7 @@ fn cmd_rules(args: AiRulesArgs) -> Result<()> {
         .clone()
         .or_else(|| cfg.api_base.clone())
         .unwrap_or_else(|| "https://api.openai.com/v1".to_string());
-    let init_model = args
-        .model
-        .clone()
-        .or_else(|| cfg.model.clone())
-        .unwrap_or_else(|| "gpt-4o".to_string());
+    let init_model: Option<String> = args.model.clone().or_else(|| cfg.model.clone());
     let protocol_str = args
         .protocol
         .clone()
@@ -93,7 +90,7 @@ fn cmd_rules(args: AiRulesArgs) -> Result<()> {
         _ => Protocol::Completions,
     };
 
-    let final_model = select_model(&init_model, &api_base, &api_key)?;
+    let final_model = select_model(init_model.as_deref(), &api_base, &api_key)?;
 
     cfg.api_key = Some(api_key.clone());
     cfg.api_base = Some(api_base.clone());
@@ -221,9 +218,14 @@ fn run_single_pass(
                 }
 
                 // 执行每个工具调用并将结果加入历史
+                // JSON 模式下非 dry_run 时拒绝写操作（无法交互确认）
                 for tc in &tool_calls {
-                    let result =
-                        ai_tools::execute_tool(&tc.name, &tc.arguments, mihomo, args.dry_run);
+                    let result = if ai_tools::is_write_tool(&tc.name) && !args.dry_run {
+                        r#"{"error":"JSON 模式下不支持执行写操作，请使用 --dry-run 或交互模式"}"#
+                            .to_string()
+                    } else {
+                        ai_tools::execute_tool(&tc.name, &tc.arguments, mihomo, args.dry_run)
+                    };
 
                     let result_msg = match config.protocol {
                         Protocol::Completions => tool_result_message_completions(&tc.id, &result),
@@ -293,9 +295,8 @@ fn run_agent_loop(
                 // 执行每个工具调用并将结果加入历史
                 for tc in &tool_calls {
                     let mut result = String::new();
-                    let is_write = tc.name == "set_mixin_field" || tc.name == "unset_mixin_field";
 
-                    if is_write && !args.dry_run {
+                    if ai_tools::is_write_tool(&tc.name) && !args.dry_run {
                         if !ask_for_approval(&tc.name, &tc.arguments) {
                             result = "User denied permission to execute this tool.".to_string();
                         }
@@ -386,27 +387,29 @@ fn resolve_controller(explicit: &Option<String>) -> Result<String> {
             }
         }
     }
-    Ok("127.0.0.1:9090".to_string())
+    Ok(constants::DEFAULT_CONTROLLER.to_string())
 }
 
 /// 模型选择：如果用户明确指定了 --model 则直接使用，否则尝试交互选择
-fn select_model(current_model: &str, api_base: &str, api_key: &str) -> Result<String> {
-    if current_model != "gpt-4o" {
-        return Ok(current_model.to_string());
+fn select_model(current_model: Option<&str>, api_base: &str, api_key: &str) -> Result<String> {
+    if let Some(model) = current_model {
+        return Ok(model.to_string());
     }
 
+    let default_model = "gpt-4o";
+
     if is_json_mode() || !std::io::stdin().is_terminal() {
-        return Ok(current_model.to_string());
+        return Ok(default_model.to_string());
     }
 
     let client = match ai_protocol::build_llm_client() {
         Ok(c) => c,
-        Err(_) => return Ok(current_model.to_string()),
+        Err(_) => return Ok(default_model.to_string()),
     };
 
     let models = match ai_protocol::list_models(&client, api_base, api_key) {
         Ok(m) if !m.is_empty() => m,
-        _ => return Ok(current_model.to_string()),
+        _ => return Ok(default_model.to_string()),
     };
 
     println!("可用模型 ({} 个):", models.len());
@@ -414,14 +417,14 @@ fn select_model(current_model: &str, api_base: &str, api_key: &str) -> Result<St
         println!("  {:>3}. {}", i + 1, name);
     }
     println!();
-    println!("输入序号选择模型（直接回车使用默认 {}）:", current_model);
+    println!("输入序号选择模型（直接回车使用默认 {}）:", default_model);
 
     let mut input = String::new();
     std::io::stdin().read_line(&mut input).ok();
     let trimmed = input.trim();
 
     if trimmed.is_empty() {
-        return Ok(current_model.to_string());
+        return Ok(default_model.to_string());
     }
 
     if let Ok(idx) = trimmed.parse::<usize>() {

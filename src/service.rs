@@ -1,4 +1,3 @@
-use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -8,8 +7,10 @@ use anyhow::{Context, Result, bail};
 use crate::cli::{
     ServiceCommand, ServiceInstallArgs, ServiceLogArgs, ServiceTargetArgs, ServiceUninstallArgs,
 };
+use crate::constants;
 use crate::output::{is_json_mode, print_json};
 use crate::paths::app_paths;
+use crate::utils::{ensure_linux_host, normalize_unit_name};
 
 #[derive(Debug, Clone)]
 struct CmdCapturedOutput {
@@ -341,14 +342,6 @@ fn run_systemctl_raw(user: bool, args: &[String]) -> Result<CmdCapturedOutput> {
     Ok(CmdCapturedOutput { stdout, stderr })
 }
 
-fn normalize_unit_name(name: &str) -> String {
-    if name.ends_with(".service") {
-        name.to_string()
-    } else {
-        format!("{name}.service")
-    }
-}
-
 fn resolve_unit_path(target: &ServiceTargetArgs, unit_name: &str) -> Result<PathBuf> {
     if target.user {
         let home = dirs::home_dir().context("无法获取 home 目录")?;
@@ -399,21 +392,18 @@ fn build_unit_content(
     )
 }
 
-fn default_runtime_config() -> &'static str {
-    "mixed-port: 7890\n\
-     allow-lan: false\n\
-     mode: rule\n\
-     log-level: info\n\
-     external-controller: 127.0.0.1:9090\n\
-     secret: \"\"\n\
-     dns:\n\
-       enable: true\n\
-       enhanced-mode: fake-ip\n"
-}
-
-fn ensure_linux_host() -> Result<()> {
-    if env::consts::OS != "linux" {
-        bail!("当前仅支持 Linux 平台");
-    }
-    Ok(())
+fn default_runtime_config() -> String {
+    format!(
+        "mixed-port: {}\n\
+         allow-lan: false\n\
+         mode: rule\n\
+         log-level: info\n\
+         external-controller: {}\n\
+         secret: \"\"\n\
+         dns:\n\
+           enable: true\n\
+           enhanced-mode: fake-ip\n",
+        constants::DEFAULT_MIXED_PORT,
+        constants::DEFAULT_CONTROLLER,
+    )
 }

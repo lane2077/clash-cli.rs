@@ -4,6 +4,9 @@ use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::PathBuf;
 
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
+
 #[derive(Debug, Serialize, Deserialize, Default, Clone)]
 pub struct AiConfig {
     pub api_key: Option<String>,
@@ -33,5 +36,11 @@ pub fn save(config: &AiConfig) -> Result<()> {
         fs::create_dir_all(parent)?;
     }
     fs::write(&path, serde_json::to_string_pretty(config)?)?;
+    // 限制文件权限为仅所有者可读写（保护 API Key）
+    #[cfg(unix)]
+    {
+        let perms = std::fs::Permissions::from_mode(0o600);
+        fs::set_permissions(&path, perms)?;
+    }
     Ok(())
 }

@@ -2,8 +2,10 @@ use std::path::PathBuf;
 
 use clap::{Args, Parser, Subcommand, ValueEnum};
 
-const DEFAULT_NO_PROXY: &str = "localhost,127.0.0.1,::1";
-const DEFAULT_SERVICE_NAME: &str = "clash-mihomo";
+use crate::constants;
+
+const DEFAULT_NO_PROXY: &str = constants::DEFAULT_NO_PROXY;
+const DEFAULT_SERVICE_NAME: &str = constants::DEFAULT_SERVICE_NAME;
 const DEFAULT_PROFILE_NAME: &str = "main";
 
 #[derive(Parser)]

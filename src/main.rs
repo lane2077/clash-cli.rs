@@ -5,6 +5,7 @@ mod ai_tools;
 mod api;
 mod auto_sudo;
 mod cli;
+mod constants;
 mod core;
 mod http;
 mod mixin;
@@ -16,6 +17,7 @@ mod service;
 mod setup;
 mod tun;
 mod update;
+mod utils;
 
 use anyhow::Result;
 use clap::Parser;

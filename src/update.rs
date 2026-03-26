@@ -10,6 +10,7 @@ use crate::auto_sudo;
 use crate::cli::{MirrorSource, UpdateCommand};
 use crate::http::{build_http_client, download_candidates, download_to_file};
 use crate::output::{is_json_mode, print_json};
+use crate::utils;
 
 const CLI_REPO: &str = "lane2077/clash-cli.rs";
 const CLI_RELEASES_LATEST_API: &str =
@@ -243,26 +244,14 @@ fn find_extracted_binary(dir: &Path) -> Result<std::path::PathBuf> {
 }
 
 fn needs_sudo(exe_path: &Path) -> bool {
-    if is_root_user() {
+    if utils::is_root_user() {
         return false;
     }
-    // 检查是否可写
-    let meta = match fs::metadata(exe_path) {
-        Ok(m) => m,
-        Err(_) => return true,
-    };
-    let mode = meta.permissions().mode();
-    // 简易检查：如果文件所有者不是当前用户，大概率需要 sudo
-    // 更可靠的方式是尝试写入，但这里用简易的权限检查
-    mode & 0o200 == 0 || exe_path.starts_with("/usr")
-}
-
-fn is_root_user() -> bool {
-    let output = std::process::Command::new("id").arg("-u").output();
-    match output {
-        Ok(v) if v.status.success() => String::from_utf8_lossy(&v.stdout).trim() == "0",
-        _ => false,
-    }
+    // 尝试以写模式打开文件，直接测试是否有写权限
+    std::fs::OpenOptions::new()
+        .write(true)
+        .open(exe_path)
+        .is_err()
 }
 
 fn mirror_str(m: MirrorSource) -> &'static str {

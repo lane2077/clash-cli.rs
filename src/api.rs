@@ -7,6 +7,7 @@ use serde_json::Value as JsonValue;
 use serde_yaml::Value as YamlValue;
 
 use crate::cli::{ApiCommand, ApiCommonArgs, ApiModeCommand};
+use crate::constants;
 use crate::output::{is_json_mode, print_json};
 use crate::paths::app_paths;
 
@@ -208,7 +209,7 @@ fn load_api_context(common: &ApiCommonArgs) -> Result<ApiContext> {
         .controller
         .clone()
         .or(config_controller)
-        .unwrap_or_else(|| "127.0.0.1:9090".to_string());
+        .unwrap_or_else(|| constants::DEFAULT_CONTROLLER.to_string());
     let secret = common.secret.clone().or(config_secret);
 
     Ok(ApiContext {

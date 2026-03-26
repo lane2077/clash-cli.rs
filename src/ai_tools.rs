@@ -29,6 +29,14 @@ impl MihomoCtx {
     }
 }
 
+/// 判断工具是否为写操作（会修改配置或重载服务）
+pub fn is_write_tool(name: &str) -> bool {
+    matches!(
+        name,
+        "set_mixin_field" | "unset_mixin_field" | "render_profile" | "reload_config"
+    )
+}
+
 /// 执行工具调用，返回 JSON 字符串结果
 pub fn execute_tool(name: &str, arguments: &str, mihomo: &MihomoCtx, dry_run: bool) -> String {
     let args: Value = serde_json::from_str(arguments).unwrap_or(Value::Object(Default::default()));

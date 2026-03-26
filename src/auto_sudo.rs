@@ -20,7 +20,7 @@ pub fn should_auto_delegate(json_mode: bool) -> bool {
     if !std::io::stdin().is_terminal() || !std::io::stderr().is_terminal() {
         return false;
     }
-    command_exists("sudo")
+    crate::utils::command_exists("sudo")
 }
 
 pub fn run_with_sudo<F>(json_mode: bool, mut append_args: F) -> Result<ExitStatus>
@@ -55,12 +55,4 @@ pub fn is_permission_denied_error(err: &anyhow::Error) -> bool {
         || msg.contains("Operation not permitted")
         || msg.contains("权限不足")
         || msg.contains("权限不够")
-}
-
-pub fn command_exists(binary: &str) -> bool {
-    Command::new(binary)
-        .arg("--version")
-        .output()
-        .map(|o| o.status.success())
-        .unwrap_or(false)
 }

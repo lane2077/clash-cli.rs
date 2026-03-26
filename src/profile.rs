@@ -1,7 +1,6 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, bail};
 use reqwest::blocking::Client;
@@ -13,33 +12,25 @@ use crate::cli::{
     ProfileAddArgs, ProfileCommand, ProfileFetchArgs, ProfileRemoveArgs, ProfileRenderArgs,
     ProfileUseArgs, ProfileValidateArgs,
 };
+use crate::constants;
 use crate::output::{is_json_mode, print_json};
 use crate::paths::{AppPaths, app_paths};
+use crate::utils;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-struct ProfileEntry {
-    name: String,
-    url: String,
-    file: String,
-    created_at: u64,
-    updated_at: Option<u64>,
+pub(crate) struct ProfileEntry {
+    pub(crate) name: String,
+    pub(crate) url: String,
+    pub(crate) file: String,
+    pub(crate) created_at: u64,
+    pub(crate) updated_at: Option<u64>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
-struct ProfileIndex {
-    active: Option<String>,
-    profiles: Vec<ProfileEntry>,
+pub(crate) struct ProfileIndex {
+    pub(crate) active: Option<String>,
+    pub(crate) profiles: Vec<ProfileEntry>,
 }
-
-const DEFAULT_LOCAL_MIXED_PORT: u16 = 7890;
-const DEFAULT_LOCAL_SOCKS_PORT: u16 = 7891;
-const DEFAULT_LOCAL_BIND_ADDRESS: &str = "127.0.0.1";
-const DEFAULT_LOCAL_CONTROLLER: &str = "127.0.0.1:9090";
-const DEFAULT_LOCAL_EXTERNAL_UI: &str = "ui";
-const DEFAULT_LOCAL_EXTERNAL_UI_NAME: &str = "metacubexd";
-const DEFAULT_LOCAL_EXTERNAL_UI_URL: &str =
-    "https://ghfast.top/https://github.com/MetaCubeX/metacubexd/archive/refs/heads/gh-pages.zip";
-const DEFAULT_SYSTEM_SERVICE_NAME: &str = "clash-mihomo.service";
 
 pub fn run(command: ProfileCommand) -> Result<()> {
     // Mixin 子命令有自己的 auto_sudo 逻辑，直接转发
@@ -89,7 +80,7 @@ fn cmd_add(args: ProfileAddArgs) -> Result<()> {
         name: args.name.clone(),
         url: args.url,
         file: format!("{}.yaml", args.name),
-        created_at: now_unix(),
+        created_at: utils::now_unix(),
         updated_at: None,
     };
 
@@ -201,7 +192,7 @@ fn cmd_use(args: ProfileUseArgs) -> Result<()> {
             "applied": apply,
             "fetched": args.fetch,
             "restarted": apply && !args.no_restart,
-            "service": normalize_unit_name(&args.service_name),
+            "service": utils::normalize_unit_name(&args.service_name),
         }));
     }
 
@@ -211,7 +202,10 @@ fn cmd_use(args: ProfileUseArgs) -> Result<()> {
         if args.no_restart {
             println!("已跳过服务重启（--no-restart）。");
         } else {
-            println!("已重启服务: {}", normalize_unit_name(&args.service_name));
+            println!(
+                "已重启服务: {}",
+                utils::normalize_unit_name(&args.service_name)
+            );
         }
     } else {
         println!(
@@ -234,7 +228,7 @@ fn cmd_fetch(args: ProfileFetchArgs) -> Result<()> {
 
         let profile_path = paths.profile_dir.join(&profile.file);
         if !args.force && profile.updated_at.is_some() && profile_path.exists() {
-            if now_unix().saturating_sub(profile.updated_at.unwrap_or(0)) < 60 {
+            if utils::now_unix().saturating_sub(profile.updated_at.unwrap_or(0)) < 60 {
                 if is_json_mode() {
                     return print_json(&serde_json::json!({
                         "ok": true,
@@ -414,7 +408,7 @@ fn validate_profile_name(name: &str) -> Result<()> {
     Ok(())
 }
 
-fn load_index(path: &Path) -> Result<ProfileIndex> {
+pub(crate) fn load_index(path: &Path) -> Result<ProfileIndex> {
     if !path.exists() {
         return Ok(ProfileIndex::default());
     }
@@ -423,7 +417,7 @@ fn load_index(path: &Path) -> Result<ProfileIndex> {
     serde_json::from_str(&content).context("解析 profile 索引失败")
 }
 
-fn save_index(path: &Path, index: &ProfileIndex) -> Result<()> {
+pub(crate) fn save_index(path: &Path, index: &ProfileIndex) -> Result<()> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)
             .with_context(|| format!("创建目录失败: {}", parent.display()))?;
@@ -453,7 +447,7 @@ fn fetch_profile_entry(entry: &mut ProfileEntry, profile_dir: &Path, _force: boo
 
     let path = profile_dir.join(&entry.file);
     fs::write(&path, body).with_context(|| format!("写入 profile 文件失败: {}", path.display()))?;
-    entry.updated_at = Some(now_unix());
+    entry.updated_at = Some(utils::now_unix());
     Ok(())
 }
 
@@ -498,14 +492,18 @@ fn deep_merge(base: &mut Value, patch: &Value) {
 }
 
 fn apply_local_listener_defaults(root: &mut Value) {
-    set_root_u16(root, "mixed-port", DEFAULT_LOCAL_MIXED_PORT);
-    set_root_u16(root, "socks-port", DEFAULT_LOCAL_SOCKS_PORT);
+    set_root_u16(root, "mixed-port", constants::DEFAULT_MIXED_PORT);
+    set_root_u16(root, "socks-port", constants::DEFAULT_SOCKS_PORT);
     set_root_bool(root, "allow-lan", false);
-    set_root_string(root, "bind-address", DEFAULT_LOCAL_BIND_ADDRESS);
-    set_root_string(root, "external-controller", DEFAULT_LOCAL_CONTROLLER);
-    set_root_string(root, "external-ui", DEFAULT_LOCAL_EXTERNAL_UI);
-    set_root_string(root, "external-ui-name", DEFAULT_LOCAL_EXTERNAL_UI_NAME);
-    set_root_string(root, "external-ui-url", DEFAULT_LOCAL_EXTERNAL_UI_URL);
+    set_root_string(root, "bind-address", constants::DEFAULT_BIND_ADDRESS);
+    set_root_string(root, "external-controller", constants::DEFAULT_CONTROLLER);
+    set_root_string(root, "external-ui", constants::DEFAULT_EXTERNAL_UI);
+    set_root_string(
+        root,
+        "external-ui-name",
+        constants::DEFAULT_EXTERNAL_UI_NAME,
+    );
+    set_root_string(root, "external-ui-url", constants::DEFAULT_EXTERNAL_UI_URL);
 }
 
 fn set_root_u16(root: &mut Value, key: &str, value: u16) {
@@ -539,23 +537,8 @@ fn key_exists(root: &Value, key: &str) -> bool {
         .unwrap_or(false)
 }
 
-fn now_unix() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|v| v.as_secs())
-        .unwrap_or(0)
-}
-
-fn normalize_unit_name(name: &str) -> String {
-    if name.ends_with(".service") {
-        name.to_string()
-    } else {
-        format!("{name}.service")
-    }
-}
-
 fn restart_system_service(name: &str) -> Result<()> {
-    let unit = normalize_unit_name(name);
+    let unit = utils::normalize_unit_name(name);
     let output = Command::new("systemctl")
         .arg("restart")
         .arg(&unit)
@@ -579,7 +562,7 @@ fn ensure_service_runtime_home_matches_current(
     service_name: &str,
     current_runtime_config: &Path,
 ) -> Result<()> {
-    let unit = normalize_unit_name(service_name);
+    let unit = utils::normalize_unit_name(service_name);
     let Some(service_runtime_config) = detect_service_runtime_config_path(&unit)? else {
         return Ok(());
     };
@@ -687,12 +670,12 @@ fn print_profile_home_hint(paths: &AppPaths) {
     }
     println!("当前配置目录: {}", paths.config_dir.display());
     if let Ok(Some(service_runtime_config)) =
-        detect_service_runtime_config_path(DEFAULT_SYSTEM_SERVICE_NAME)
+        detect_service_runtime_config_path(constants::DEFAULT_SYSTEM_SERVICE_UNIT)
     {
         if !path_eq(&service_runtime_config, &paths.runtime_config_file) {
             println!(
                 "提示: {} 当前使用配置: {}",
-                DEFAULT_SYSTEM_SERVICE_NAME,
+                constants::DEFAULT_SYSTEM_SERVICE_UNIT,
                 service_runtime_config.display()
             );
             if let Some(home) = infer_home_from_runtime_config(&service_runtime_config) {
@@ -818,6 +801,7 @@ fn profile_command_to_cli_args(command: &ProfileCommand) -> Result<Vec<String>> 
 #[cfg(test)]
 mod tests {
     use std::path::PathBuf;
+    use std::time::{SystemTime, UNIX_EPOCH};
 
     use super::*;
 

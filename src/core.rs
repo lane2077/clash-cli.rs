@@ -14,6 +14,7 @@ use crate::cli::{Amd64Variant, CoreCommand, CoreInstallArgs, CoreUpgradeArgs, Mi
 use crate::http::{build_http_client, download_candidates, download_to_file};
 use crate::output::{is_json_mode, print_json};
 use crate::paths::app_paths;
+use crate::utils::ensure_linux_host;
 
 const GITHUB_REPO: &str = "MetaCubeX/mihomo";
 const RELEASES_LATEST_API: &str = "https://api.github.com/repos/MetaCubeX/mihomo/releases/latest";
@@ -222,13 +223,6 @@ fn install_mihomo_core(request: CoreInstallRequest) -> Result<()> {
     println!("内核安装完成: {} ({})", tag, asset.name);
     println!("内核路径: {}", installed_binary.display());
     println!("下载来源: {}", source_url);
-    Ok(())
-}
-
-fn ensure_linux_host() -> Result<()> {
-    if env::consts::OS != "linux" {
-        bail!("当前仅支持 Linux 平台");
-    }
     Ok(())
 }
 

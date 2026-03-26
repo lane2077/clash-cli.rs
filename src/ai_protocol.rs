@@ -210,7 +210,6 @@ fn call_responses(
     }
 
     let json: Value = serde_json::from_str(&text).context("解析 Responses API JSON 失败")?;
-    println!("--- Turn RAW Responses JSON ---\n{}\n---", json);
 
     let output = json
         .get("output")
