@@ -1,7 +1,3 @@
-mod ai;
-mod ai_config;
-mod ai_protocol;
-mod ai_tools;
 mod api;
 mod auto_sudo;
 mod cli;
@@ -51,7 +47,6 @@ fn run() -> Result<()> {
         Commands::Api { command } => api::run(command)?,
         Commands::Setup { command } => setup::run(command)?,
         Commands::Update { command } => update::run(command)?,
-        Commands::Ai { command } => ai::run(command)?,
     }
 
     Ok(())

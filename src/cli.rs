@@ -59,11 +59,6 @@ pub enum Commands {
         #[command(subcommand)]
         command: UpdateCommand,
     },
-    #[command(about = "AI 智能分析连接日志并优化路由规则")]
-    Ai {
-        #[command(subcommand)]
-        command: AiCommand,
-    },
 }
 
 #[derive(Subcommand)]
@@ -595,53 +590,4 @@ pub struct UpdateArgs {
         help = "下载镜像策略"
     )]
     pub mirror: MirrorSource,
-}
-
-// --- AI 命令 ---
-
-#[derive(Subcommand)]
-pub enum AiCommand {
-    #[command(about = "分析连接日志，AI 自动优化路由规则")]
-    Rules(AiRulesArgs),
-    #[command(about = "列出可用 LLM 模型")]
-    Models(AiModelsArgs),
-}
-
-#[derive(Args, Clone)]
-pub struct AiRulesArgs {
-    #[arg(long, env = "OPENAI_API_KEY", help = "OpenAI API Key")]
-    pub api_key: Option<String>,
-
-    #[arg(
-        long,
-        help = "API 地址（支持 OpenAI 兼容端点），默认 https://api.openai.com/v1"
-    )]
-    pub api_base: Option<String>,
-
-    #[arg(long, help = "模型名称，默认 gpt-4o")]
-    pub model: Option<String>,
-
-    #[arg(long, help = "API 协议：completions 或 responses，默认 responses")]
-    pub protocol: Option<String>,
-
-    #[arg(long, default_value_t = 20, help = "最大 agent loop 轮次")]
-    pub max_turns: usize,
-
-    #[arg(long, help = "仅分析不执行写操作")]
-    pub dry_run: bool,
-
-    #[arg(long, help = "mihomo API 地址")]
-    pub controller: Option<String>,
-
-    #[arg(long, help = "mihomo API secret")]
-    pub secret: Option<String>,
-}
-
-#[derive(Args, Clone)]
-pub struct AiModelsArgs {
-    #[arg(long, env = "OPENAI_API_KEY", help = "OpenAI API Key")]
-    pub api_key: Option<String>,
-
-    #[arg(long, help = "API 地址，默认 https://api.openai.com/v1")]
-    pub api_base: Option<String>,
 }
