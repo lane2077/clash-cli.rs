@@ -13,7 +13,7 @@ use crate::cli::{
     Amd64Variant, ApiCommand, ApiCommonArgs, CoreCommand, CoreInstallArgs, MirrorSource,
     ProfileAddArgs, ProfileCommand, ProfileFetchArgs, ProfileRenderArgs, ProfileUseArgs,
     ServiceCommand, ServiceInstallArgs, ServiceTargetArgs, SetupCommand, SetupInitArgs,
-    SetupUnifyArgs, TunApplyArgs, TunCommand,
+    SetupUnifyArgs, TunApplyArgs, TunCommand, UiCommand, UiInstallArgs,
 };
 use crate::core;
 use crate::output::is_json_mode;
@@ -21,6 +21,7 @@ use crate::paths::app_paths;
 use crate::profile::{self, ProfileEntry, ProfileIndex, load_index, save_index};
 use crate::service;
 use crate::tun;
+use crate::ui;
 use crate::utils;
 
 const DEFAULT_SYSTEM_HOME: &str = "/etc/clash-cli";
@@ -33,7 +34,7 @@ pub fn run(command: SetupCommand) -> Result<()> {
 }
 
 fn cmd_init(args: SetupInitArgs) -> Result<()> {
-    utils::ensure_linux_host()?;
+    utils::ensure_supported_host()?;
     if ensure_setup_privileges_or_delegate(SetupAction::Init(&args))? == PrivilegeCheck::Delegated {
         return Ok(());
     }
@@ -57,6 +58,11 @@ fn cmd_init(args: SetupInitArgs) -> Result<()> {
     }))?;
 
     let paths = app_paths()?;
+    let workdir = if utils::is_macos() && args.workdir == Path::new("/var/lib/clash-cli") {
+        paths.runtime_dir.clone()
+    } else {
+        args.workdir.clone()
+    };
     if !paths.core_current_link.exists() {
         bail!(
             "内核安装后未找到当前软链: {}",
@@ -64,8 +70,20 @@ fn cmd_init(args: SetupInitArgs) -> Result<()> {
         );
     }
 
-    install_binary(&paths.core_current_link, &args.binary)?;
-    println!("已安装 mihomo 到: {}", args.binary.display());
+    if args.binary != paths.core_current_link {
+        match install_binary(&paths.core_current_link, &args.binary) {
+            Ok(()) => println!("已将内核复制到 PATH: {}", args.binary.display()),
+            Err(err) if utils::is_macos() && !utils::is_root_user() => {
+                eprintln!(
+                    "警告: 未能写入 {}: {err}。服务将使用 {}",
+                    args.binary.display(),
+                    paths.core_current_link.display()
+                );
+            }
+            Err(err) => return Err(err),
+        }
+    }
+    println!("服务内核路径: {}", paths.core_current_link.display());
 
     ensure_profile_ready(&args.profile_name, &args.profile_url, &args.service_name)?;
     profile::run(ProfileCommand::Render(ProfileRenderArgs {
@@ -78,22 +96,31 @@ fn cmd_init(args: SetupInitArgs) -> Result<()> {
     service::run(ServiceCommand::Install(ServiceInstallArgs {
         target: ServiceTargetArgs {
             name: args.service_name.clone(),
-            user: false,
+            user: utils::is_macos() && !utils::is_root_user(),
         },
-        binary: Some(args.binary.clone()),
+        binary: Some(paths.core_current_link.clone()),
         config: Some(paths.runtime_config_file.clone()),
-        workdir: Some(args.workdir.clone()),
+        workdir: Some(workdir.clone()),
         force: true,
         no_enable: false,
         no_start: false,
     }))?;
+
+    if let Err(err) = ui::run(Some(UiCommand::Install(UiInstallArgs {
+        mirror: args.mirror,
+        force: false,
+        workdir: Some(workdir.clone()),
+    }))) {
+        eprintln!("警告: Web UI 安装失败: {err}");
+        eprintln!("稍后执行: clash ui install --workdir {}", workdir.display());
+    }
 
     if args.no_tun {
         println!("已跳过 tun 开启（--no-tun）。");
     } else {
         tun::run(TunCommand::On(TunApplyArgs {
             name: args.service_name.clone(),
-            user: false,
+            user: utils::is_macos() && !utils::is_root_user(),
             no_restart: false,
         }))?;
     }
@@ -102,18 +129,22 @@ fn cmd_init(args: SetupInitArgs) -> Result<()> {
     println!("初始化完成。");
     println!("配置目录: {}", paths.config_dir.display());
     println!("运行配置: {}", paths.runtime_config_file.display());
-    println!(
-        "服务名称: {}.service",
-        trim_service_suffix(&args.service_name)
-    );
-    println!("工作目录: {}", args.workdir.display());
+    if utils::is_macos() {
+        println!("服务标签: {}", service::launchd_label(&args.service_name));
+    } else {
+        println!(
+            "服务名称: {}.service",
+            trim_service_suffix(&args.service_name)
+        );
+    }
+    println!("工作目录: {}", workdir.display());
     api::run(ApiCommand::UiUrl(ApiCommonArgs {
         controller: None,
         secret: None,
         timeout_secs: 15,
     }))?;
     println!("可直接执行: clash proxy start");
-    println!("当前终端生效: eval \"$(clash proxy env on)\"");
+    println!("当前终端生效: eval \"$(clash env on)\"");
     Ok(())
 }
 
@@ -133,7 +164,7 @@ struct LinkStats {
 }
 
 fn cmd_unify(args: SetupUnifyArgs) -> Result<()> {
-    utils::ensure_linux_host()?;
+    utils::ensure_supported_host()?;
     if ensure_setup_privileges_or_delegate(SetupAction::Unify(&args))? == PrivilegeCheck::Delegated
     {
         return Ok(());
@@ -294,6 +325,9 @@ fn trim_service_suffix(name: &str) -> String {
 }
 
 fn ensure_root_user() -> Result<()> {
+    if crate::utils::is_macos() {
+        return Ok(());
+    }
     if !utils::is_root_user() {
         bail!(
             "请使用 root 执行，例如: sudo env CLASH_CLI_HOME=/etc/clash-cli clash setup init --profile-url <URL>"
@@ -303,13 +337,17 @@ fn ensure_root_user() -> Result<()> {
 }
 
 fn ensure_setup_home_for_root() {
-    if env::var_os("CLASH_CLI_HOME").is_none() {
-        crate::paths::set_home_override(PathBuf::from(DEFAULT_SYSTEM_HOME));
-        println!(
-            "未设置 CLASH_CLI_HOME，默认使用系统目录: {}",
-            DEFAULT_SYSTEM_HOME
-        );
+    if env::var_os("CLASH_CLI_HOME").is_some() {
+        return;
     }
+    if crate::utils::is_macos() && !utils::is_root_user() {
+        return;
+    }
+    crate::paths::set_home_override(PathBuf::from(DEFAULT_SYSTEM_HOME));
+    println!(
+        "未设置 CLASH_CLI_HOME，默认使用系统目录: {}",
+        DEFAULT_SYSTEM_HOME
+    );
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -326,6 +364,16 @@ enum SetupAction<'a> {
 fn ensure_setup_privileges_or_delegate(action: SetupAction<'_>) -> Result<PrivilegeCheck> {
     if utils::is_root_user() {
         return Ok(PrivilegeCheck::Ok);
+    }
+    // macOS 无 TUN 时用用户 LaunchAgent 即可；开启 TUN 才需要 root / LaunchDaemon。
+    if utils::is_macos() {
+        let needs_root_for_tun = match action {
+            SetupAction::Init(args) => !args.no_tun,
+            SetupAction::Unify(_) => false,
+        };
+        if !needs_root_for_tun {
+            return Ok(PrivilegeCheck::Ok);
+        }
     }
     if !auto_sudo::should_auto_delegate(is_json_mode()) {
         return Ok(PrivilegeCheck::Ok);

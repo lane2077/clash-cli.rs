@@ -9,40 +9,86 @@ const DEFAULT_SERVICE_NAME: &str = constants::DEFAULT_SERVICE_NAME;
 const DEFAULT_PROFILE_NAME: &str = "main";
 
 #[derive(Parser)]
-#[command(name = "clash", version, about = "面向 Linux 的 Clash 命令行工具")]
+#[command(
+    name = "clash",
+    version,
+    about = "面向 Linux 与 macOS 的 Clash 命令行工具"
+)]
 pub struct Cli {
-    #[arg(long, global = true, help = "以 JSON 格式输出")]
+    #[arg(
+        long,
+        global = true,
+        env = "CLASH_CLI_JSON",
+        conflicts_with = "text",
+        help = "强制 JSON（终端里默认是中文；管道/脚本里本来就是 JSON）"
+    )]
     pub json: bool,
+    #[arg(
+        long,
+        global = true,
+        conflicts_with = "json",
+        help = "强制人类可读文本（管道里默认 JSON，需要中文时加这个）"
+    )]
+    pub text: bool,
     #[command(subcommand)]
     pub command: Commands,
 }
 
 #[derive(Subcommand)]
 pub enum Commands {
-    #[command(about = "管理终端代理（start/stop/env/auto/status）")]
+    #[command(about = "仪表板（metacubexd Web UI）")]
+    Ui {
+        #[command(subcommand)]
+        command: Option<UiCommand>,
+    },
+    #[command(about = "出站模式（规则/全局/直连）", subcommand_required = false)]
+    Mode {
+        #[command(subcommand)]
+        action: Option<ApiModeCommand>,
+        #[command(flatten)]
+        common: ApiCommonArgs,
+    },
+    #[command(
+        name = "sub",
+        about = "订阅（list/use/update/add；mixin 覆盖）",
+        visible_alias = "profile"
+    )]
+    Sub {
+        #[command(subcommand)]
+        command: ProfileCommand,
+    },
+    #[command(
+        about = "代理（查看代理组并切换当前节点）",
+        subcommand_required = false
+    )]
     Proxy {
         #[command(subcommand)]
-        command: ProxyCommand,
+        command: Option<ProxyCommand>,
+    },
+    #[command(about = "系统代理（桌面 HTTP/SOCKS，浏览器等）")]
+    System {
+        #[command(subcommand)]
+        action: SystemProxyAction,
+    },
+    #[command(about = "TUN 模式（诊断/开启/关闭/状态）")]
+    Tun {
+        #[command(subcommand)]
+        command: TunCommand,
+    },
+    #[command(about = "复制环境变量（供 eval \"$(clash env on)\"）")]
+    Env {
+        #[command(subcommand)]
+        action: EnvAction,
     },
     #[command(about = "管理 mihomo 内核安装、升级、版本与路径")]
     Core {
         #[command(subcommand)]
         command: CoreCommand,
     },
-    #[command(about = "管理 systemd 服务（install/start/stop/status/log）")]
+    #[command(about = "管理 systemd / launchd 服务（install/start/stop/status/log）")]
     Service {
         #[command(subcommand)]
         command: ServiceCommand,
-    },
-    #[command(about = "管理 TUN 模式（诊断/开启/关闭/状态）")]
-    Tun {
-        #[command(subcommand)]
-        command: TunCommand,
-    },
-    #[command(about = "管理订阅 profile（add/fetch/render/validate/mixin）")]
-    Profile {
-        #[command(subcommand)]
-        command: ProfileCommand,
     },
     #[command(about = "访问 mihomo external-controller API")]
     Api {
@@ -61,24 +107,98 @@ pub enum Commands {
     },
 }
 
+impl Commands {
+    /// stdout 本身就是产品（供 eval / follow），管道里也不要自动改成 JSON。
+    pub fn keeps_raw_stdout(&self) -> bool {
+        match self {
+            Commands::Env { .. } => true,
+            Commands::Proxy {
+                command: Some(ProxyCommand::Env { .. }),
+            } => true,
+            Commands::Service {
+                command: ServiceCommand::Log(args),
+            } if args.follow => true,
+            // setup 会串联多个现有命令并输出进度，暂时保持文本流；否则非 TTY
+            // 自动 JSON 会与 setup 当前的交互式输出模型冲突。
+            Commands::Setup { .. } => true,
+            _ => false,
+        }
+    }
+}
+
 #[derive(Subcommand)]
 pub enum ProxyCommand {
-    #[command(about = "写入代理状态（默认端口来自 runtime 配置）")]
+    #[command(about = "查看代理组与当前节点")]
+    List(ApiCommonArgs),
+    #[command(about = "切换代理组中的节点")]
+    Switch(ApiProxySwitchArgs),
+    #[command(about = "写入终端代理状态（默认端口来自 runtime 配置）", hide = true)]
     Start(StartArgs),
-    #[command(about = "清理代理状态，可选移除 shell 自动启用钩子")]
+    #[command(about = "清理终端代理状态，可选移除 shell 自动启用钩子", hide = true)]
     Stop(StopArgs),
-    #[command(about = "查看当前代理状态与自动启用状态")]
+    #[command(about = "查看终端代理状态与自动启用状态", hide = true)]
     Status,
-    #[command(about = "输出当前终端可执行的环境变量脚本（on/off）")]
+    #[command(about = "输出当前终端可执行的环境变量脚本（on/off）", hide = true)]
     Env {
         #[command(subcommand)]
         action: EnvAction,
     },
-    #[command(about = "管理新终端自动启用代理（on/off/status）")]
+    #[command(about = "管理新终端自动启用代理（on/off/status）", hide = true)]
     Auto {
         #[command(subcommand)]
         action: AutoAction,
     },
+    #[command(about = "系统代理（桌面 HTTP/SOCKS，与 tun 分开）", hide = true)]
+    System {
+        #[command(subcommand)]
+        action: SystemProxyAction,
+    },
+}
+
+impl ProxyCommand {
+    /// 代理组/节点走 mihomo HTTP；其余走终端 env / 桌面系统代理，不碰 HTTP 客户端。
+    pub fn into_node_api(self) -> Result<ApiCommand, Self> {
+        match self {
+            Self::List(common) => Ok(ApiCommand::Proxies(common)),
+            Self::Switch(args) => Ok(ApiCommand::ProxySwitch(args)),
+            other => Err(other),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn node_verbs_map_to_api_not_shell_writer() {
+        assert!(
+            ProxyCommand::List(ApiCommonArgs::default())
+                .into_node_api()
+                .is_ok()
+        );
+        let switch = ProxyCommand::Switch(ApiProxySwitchArgs {
+            group: "Proxy".into(),
+            proxy: "香港".into(),
+            common: ApiCommonArgs::default(),
+        });
+        assert!(switch.into_node_api().is_ok());
+        assert!(ProxyCommand::Status.into_node_api().is_err());
+        assert!(
+            ProxyCommand::Env {
+                action: EnvAction::On
+            }
+            .into_node_api()
+            .is_err()
+        );
+        assert!(
+            ProxyCommand::System {
+                action: SystemProxyAction::Status
+            }
+            .into_node_api()
+            .is_err()
+        );
+    }
 }
 
 #[derive(Subcommand)]
@@ -95,23 +215,23 @@ pub enum CoreCommand {
 
 #[derive(Subcommand)]
 pub enum ServiceCommand {
-    #[command(about = "安装 systemd service unit 并按需启用/启动")]
+    #[command(about = "安装 systemd unit / launchd plist 并按需启用/启动")]
     Install(ServiceInstallArgs),
-    #[command(about = "卸载 systemd service unit，可选清理运行目录")]
+    #[command(about = "卸载 systemd unit / launchd plist，可选清理运行目录")]
     Uninstall(ServiceUninstallArgs),
-    #[command(about = "启用开机自启（systemctl enable）")]
+    #[command(about = "启用开机自启")]
     Enable(ServiceTargetArgs),
-    #[command(about = "关闭开机自启（systemctl disable）")]
+    #[command(about = "关闭开机自启")]
     Disable(ServiceTargetArgs),
-    #[command(about = "启动服务（systemctl start）")]
+    #[command(about = "启动服务")]
     Start(ServiceTargetArgs),
-    #[command(about = "停止服务（systemctl stop）")]
+    #[command(about = "停止服务")]
     Stop(ServiceTargetArgs),
-    #[command(about = "重启服务（systemctl restart）")]
+    #[command(about = "重启服务")]
     Restart(ServiceTargetArgs),
-    #[command(about = "查看服务状态（systemctl status）")]
+    #[command(about = "查看服务状态")]
     Status(ServiceTargetArgs),
-    #[command(about = "查看服务日志（journalctl）")]
+    #[command(about = "查看服务日志")]
     Log(ServiceLogArgs),
 }
 
@@ -129,19 +249,21 @@ pub enum TunCommand {
 
 #[derive(Subcommand, Clone)]
 pub enum ProfileCommand {
-    #[command(about = "添加订阅 profile")]
+    #[command(about = "添加订阅")]
     Add(ProfileAddArgs),
-    #[command(about = "列出所有 profile 与当前 active")]
+    #[command(about = "列出所有订阅与当前生效项")]
     List,
-    #[command(about = "切换当前 active profile")]
+    #[command(about = "切换当前订阅（加 --apply 立即渲染生效）")]
     Use(ProfileUseArgs),
-    #[command(about = "拉取指定 profile 的最新订阅内容")]
+    #[command(about = "拉取指定订阅的最新内容（不渲染）")]
     Fetch(ProfileFetchArgs),
-    #[command(about = "删除 profile")]
+    #[command(about = "拉取订阅并渲染生效（fetch --force + 渲染 + 重启服务）")]
+    Update(ProfileUpdateArgs),
+    #[command(about = "删除订阅")]
     Remove(ProfileRemoveArgs),
-    #[command(about = "将 profile 渲染到运行配置 runtime/config.yaml")]
+    #[command(about = "将订阅渲染到运行配置 runtime/config.yaml")]
     Render(ProfileRenderArgs),
-    #[command(about = "校验 profile YAML 基础合法性")]
+    #[command(about = "校验订阅 YAML 基础合法性")]
     Validate(ProfileValidateArgs),
     #[command(about = "管理 mixin.yaml 覆盖配置（show/set/unset/reset）")]
     Mixin {
@@ -224,10 +346,24 @@ pub struct ProfileUseArgs {
     #[arg(
         long,
         default_value = DEFAULT_SERVICE_NAME,
-        help = "apply 后联动重启的 systemd 服务名"
+        help = "apply 后联动重启的服务名"
     )]
     pub service_name: String,
     #[arg(long, help = "apply 后仅渲染，不自动重启服务")]
+    pub no_restart: bool,
+}
+
+#[derive(Args, Clone)]
+pub struct ProfileUpdateArgs {
+    #[arg(long, help = "profile 名称，默认当前 active")]
+    pub name: Option<String>,
+    #[arg(
+        long,
+        default_value = DEFAULT_SERVICE_NAME,
+        help = "渲染后联动重启的服务名"
+    )]
+    pub service_name: String,
+    #[arg(long, help = "仅渲染，不自动重启服务")]
     pub no_restart: bool,
 }
 
@@ -271,6 +407,16 @@ pub struct ApiCommonArgs {
     pub secret: Option<String>,
     #[arg(long, default_value_t = 15, help = "API 请求超时秒数")]
     pub timeout_secs: u64,
+}
+
+impl Default for ApiCommonArgs {
+    fn default() -> Self {
+        Self {
+            controller: None,
+            secret: None,
+            timeout_secs: 15,
+        }
+    }
 }
 
 #[derive(Args, Clone)]
@@ -347,9 +493,9 @@ impl ApiModeValue {
 
 #[derive(Args, Clone)]
 pub struct TunApplyArgs {
-    #[arg(long, default_value = DEFAULT_SERVICE_NAME, help = "联动重启的 systemd 服务名")]
+    #[arg(long, default_value = DEFAULT_SERVICE_NAME, help = "联动重启的服务名")]
     pub name: String,
-    #[arg(long, help = "联动操作 user 级服务（systemctl --user）")]
+    #[arg(long, help = "联动操作 user 级服务（LaunchAgent / systemd --user）")]
     pub user: bool,
     #[arg(long, help = "仅修改配置，不自动重启服务")]
     pub no_restart: bool,
@@ -357,9 +503,9 @@ pub struct TunApplyArgs {
 
 #[derive(Args, Clone)]
 pub struct TunStatusArgs {
-    #[arg(long, default_value = DEFAULT_SERVICE_NAME, help = "用于检查状态的 systemd 服务名")]
+    #[arg(long, default_value = DEFAULT_SERVICE_NAME, help = "用于检查状态的服务名")]
     pub name: String,
-    #[arg(long, help = "检查 user 级服务（systemctl --user）")]
+    #[arg(long, help = "检查 user 级服务（LaunchAgent / systemd --user）")]
     pub user: bool,
 }
 
@@ -477,12 +623,12 @@ pub struct SetupInitArgs {
     #[arg(
         long,
         default_value = "/usr/local/bin/mihomo",
-        help = "mihomo 安装路径"
+        help = "将内核复制到该 PATH（服务启动仍使用 core 软链）"
     )]
     pub binary: PathBuf,
     #[arg(long, default_value = "/var/lib/clash-cli", help = "service 工作目录")]
     pub workdir: PathBuf,
-    #[arg(long, default_value = DEFAULT_SERVICE_NAME, help = "systemd 服务名")]
+    #[arg(long, default_value = DEFAULT_SERVICE_NAME, help = "服务名（systemd / launchd）")]
     pub service_name: String,
     #[arg(long, help = "初始化完成后不自动开启 tun")]
     pub no_tun: bool,
@@ -490,7 +636,7 @@ pub struct SetupInitArgs {
 
 #[derive(Args, Clone)]
 pub struct SetupUnifyArgs {
-    #[arg(long, default_value = DEFAULT_SERVICE_NAME, help = "联动重启的 systemd 服务名")]
+    #[arg(long, default_value = DEFAULT_SERVICE_NAME, help = "联动重启的服务名")]
     pub service_name: String,
     #[arg(long, help = "仅收敛 profile，不渲染与重启服务")]
     pub no_apply: bool,
@@ -500,9 +646,9 @@ pub struct SetupUnifyArgs {
 
 #[derive(Args, Clone)]
 pub struct ServiceTargetArgs {
-    #[arg(long, default_value = DEFAULT_SERVICE_NAME, help = "systemd 服务名")]
+    #[arg(long, default_value = DEFAULT_SERVICE_NAME, help = "服务名（systemd / launchd）")]
     pub name: String,
-    #[arg(long, help = "操作 user 级服务（systemctl --user）")]
+    #[arg(long, help = "操作 user 级服务（LaunchAgent / systemd --user）")]
     pub user: bool,
 }
 
@@ -540,6 +686,16 @@ pub struct ServiceLogArgs {
     pub follow: bool,
     #[arg(short = 'n', long, default_value_t = 100, help = "读取最近 N 行")]
     pub lines: usize,
+}
+
+#[derive(Subcommand, Clone)]
+pub enum SystemProxyAction {
+    #[command(about = "开启桌面系统代理（GNOME gsettings / macOS networksetup）")]
+    On,
+    #[command(about = "关闭桌面系统代理并尽量恢复原设置")]
+    Off,
+    #[command(about = "查看系统代理是否由本工具开启")]
+    Status,
 }
 
 #[derive(Subcommand)]
@@ -583,6 +739,7 @@ impl AutoAction {
 pub enum ShellKind {
     Bash,
     Zsh,
+    Fish,
 }
 
 impl ShellKind {
@@ -590,6 +747,7 @@ impl ShellKind {
         match self {
             ShellKind::Bash => "bash",
             ShellKind::Zsh => "zsh",
+            ShellKind::Fish => "fish",
         }
     }
 }
@@ -636,6 +794,36 @@ pub struct MixinSetArgs {
 
 // --- Update 命令 ---
 
+#[derive(Subcommand, Clone)]
+pub enum UiCommand {
+    #[command(about = "下载 metacubexd 到内核工作目录的 ui/")]
+    Install(UiInstallArgs),
+    #[command(about = "查看 Web UI 是否已安装及访问地址")]
+    Status,
+    #[command(about = "打印 Dashboard 地址")]
+    Url,
+    #[command(about = "尝试用系统浏览器打开 Dashboard")]
+    Open,
+}
+
+#[derive(Args, Clone)]
+pub struct UiInstallArgs {
+    #[arg(
+        long,
+        value_enum,
+        default_value_t = MirrorSource::Auto,
+        help = "下载镜像策略"
+    )]
+    pub mirror: MirrorSource,
+    #[arg(long, help = "已安装也重新下载")]
+    pub force: bool,
+    #[arg(
+        long,
+        help = "内核工作目录（-d），UI 安装到 <workdir>/ui，默认 runtime 目录"
+    )]
+    pub workdir: Option<PathBuf>,
+}
+
 #[derive(Subcommand)]
 pub enum UpdateCommand {
     #[command(about = "下载最新版本 CLI 并替换当前二进制")]
@@ -653,4 +841,6 @@ pub struct UpdateArgs {
         help = "下载镜像策略"
     )]
     pub mirror: MirrorSource,
+    #[arg(long, help = "可选：预期的 SHA256（hex）用于校验下载资产")]
+    pub sha256: Option<String>,
 }

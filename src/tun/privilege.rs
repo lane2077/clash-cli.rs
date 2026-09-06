@@ -50,6 +50,14 @@ fn has_capability_bit(bit: u32) -> Result<bool> {
 
 fn ensure_tun_privileges() -> Result<()> {
     let is_root = utils::is_root_user();
+    if utils::is_macos() {
+        if is_root {
+            return Ok(());
+        }
+        bail!(
+            "macOS 开启 TUN 需要 root（创建 utun / 改路由）。请使用 sudo，例如 `sudo clash tun on`"
+        );
+    }
     let has_admin = has_capability_bit(CAP_NET_ADMIN_BIT).unwrap_or(false);
     let has_raw = has_capability_bit(CAP_NET_RAW_BIT).unwrap_or(false);
     if is_root || (has_admin && has_raw) {
@@ -64,6 +72,10 @@ pub(super) fn ensure_tun_privileges_or_delegate(
     action: TunAction,
     args: &TunApplyArgs,
 ) -> Result<PrivilegeCheck> {
+    // macOS 关闭 TUN 只写 mixin/render，不碰 nft；无需 root。
+    if action == TunAction::Off && utils::is_macos() {
+        return Ok(PrivilegeCheck::Ok);
+    }
     if ensure_tun_privileges().is_ok() {
         return Ok(PrivilegeCheck::Ok);
     }

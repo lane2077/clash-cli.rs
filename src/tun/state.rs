@@ -4,6 +4,7 @@ use std::path::Path;
 use anyhow::{Context, Result};
 
 use crate::constants::DEFAULT_REDIR_PORT;
+use crate::utils::write_atomic_text;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum RuleBackend {
@@ -109,7 +110,7 @@ pub(super) fn write_tun_state(path: &Path, state: TunState) -> Result<()> {
         fs::create_dir_all(parent)
             .with_context(|| format!("创建目录失败: {}", parent.display()))?;
     }
-    fs::write(path, state.to_text())
+    write_atomic_text(path, &state.to_text())
         .with_context(|| format!("写入 tun 状态失败: {}", path.display()))
 }
 

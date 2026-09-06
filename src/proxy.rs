@@ -1,31 +1,29 @@
+//! 终端 HTTP/SOCKS 环境变量与桌面系统代理。代理组/节点不在本模块。
+
 use std::env;
 use std::fs;
 use std::io::{self, IsTerminal};
 use std::path::Path;
 
 use anyhow::{Context, Result, bail};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_yaml::Value as YamlValue;
 
-use crate::cli::{AutoAction, EnvAction, ProxyCommand, ShellKind, StartArgs, StopArgs};
+use crate::cli::{
+    AutoAction, EnvAction, ProxyCommand, ShellKind, StartArgs, StopArgs, SystemProxyAction,
+};
 use crate::constants;
 use crate::output::{is_json_mode, print_json};
 use crate::paths::app_paths;
+use crate::utils;
 
 const HOOK_START: &str = "# >>> clash-cli proxy >>>";
 const HOOK_END: &str = "# <<< clash-cli proxy <<<";
 const DEFAULT_PROXY_HOST: &str = constants::DEFAULT_BIND_ADDRESS;
 const DEFAULT_HTTP_PORT: u16 = constants::DEFAULT_MIXED_PORT;
 const DEFAULT_SOCKS_PORT: u16 = constants::DEFAULT_SOCKS_PORT;
-const SHELL_HOOK_BODY: &str = r#"if [ -n "$CLASH_CLI_HOME" ] && [ -f "$CLASH_CLI_HOME/proxy.env" ]; then
-  . "$CLASH_CLI_HOME/proxy.env"
-elif [ -n "$XDG_CONFIG_HOME" ] && [ -f "$XDG_CONFIG_HOME/clash-cli/proxy.env" ]; then
-  . "$XDG_CONFIG_HOME/clash-cli/proxy.env"
-elif [ -f "$HOME/.config/clash-cli/proxy.env" ]; then
-  . "$HOME/.config/clash-cli/proxy.env"
-fi"#;
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 struct ProxyState {
     host: String,
     http_port: u16,
@@ -43,23 +41,23 @@ struct RuntimeProxyDefaults {
 
 impl ProxyState {
     fn to_state_file(&self) -> String {
-        format!(
-            "host={}\nhttp_port={}\nsocks_port={}\nno_proxy={}\n",
-            self.host, self.http_port, self.socks_port, self.no_proxy
-        )
+        serde_json::to_string_pretty(self).expect("ProxyState 序列化不应失败")
     }
 
     fn from_state_file(content: &str) -> Result<Self> {
+        if let Ok(state) = serde_json::from_str(content) {
+            return Ok(state);
+        }
+
+        // 兼容旧版 key=value 状态文件；新写入统一使用 JSON，避免换行破坏边界。
         let mut host = None;
         let mut http_port = None;
         let mut socks_port = None;
         let mut no_proxy = None;
-
         for line in content.lines() {
             let mut parts = line.splitn(2, '=');
             let key = parts.next().unwrap_or_default().trim();
             let value = parts.next().unwrap_or_default().trim();
-
             match key {
                 "host" => host = Some(value.to_string()),
                 "http_port" => http_port = Some(value.parse::<u16>().context("http_port 无效")?),
@@ -68,7 +66,6 @@ impl ProxyState {
                 _ => {}
             }
         }
-
         Ok(Self {
             host: host.context("状态文件缺少 host")?,
             http_port: http_port.context("状态文件缺少 http_port")?,
@@ -78,8 +75,9 @@ impl ProxyState {
     }
 
     fn export_script(&self) -> String {
-        let http_endpoint = format!("http://{}:{}", self.host, self.http_port);
-        let socks_endpoint = format!("socks5://{}:{}", self.host, self.socks_port);
+        let http_endpoint = shell_quote(&format!("http://{}:{}", self.host, self.http_port));
+        let socks_endpoint = shell_quote(&format!("socks5://{}:{}", self.host, self.socks_port));
+        let no_proxy = shell_quote(&self.no_proxy);
         format!(
             "export http_proxy={http}\n\
              export https_proxy={http}\n\
@@ -91,18 +89,26 @@ impl ProxyState {
              export NO_PROXY={no_proxy}\n",
             http = http_endpoint,
             socks = socks_endpoint,
-            no_proxy = self.no_proxy
+            no_proxy = no_proxy
         )
     }
 }
 
+fn shell_quote(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "'\"'\"'"))
+}
+
 pub fn run(command: ProxyCommand) -> Result<()> {
     match command {
+        ProxyCommand::List(_) | ProxyCommand::Switch(_) => {
+            bail!("内部错误: 代理组/节点必须走 API 入口，不得写入 proxy.state")
+        }
         ProxyCommand::Start(args) => cmd_start(args),
         ProxyCommand::Stop(args) => cmd_stop(args),
         ProxyCommand::Status => cmd_status(),
         ProxyCommand::Env { action } => cmd_env(action),
         ProxyCommand::Auto { action } => cmd_auto(action),
+        ProxyCommand::System { action } => cmd_system(action),
     }
 }
 
@@ -112,8 +118,10 @@ fn cmd_start(args: StartArgs) -> Result<()> {
     let state = resolve_start_proxy_state(&args, runtime_defaults);
 
     fs::create_dir_all(&paths.config_dir).context("创建配置目录失败")?;
-    fs::write(&paths.state_file, state.to_state_file()).context("写入代理状态失败")?;
-    fs::write(&paths.env_file, state.export_script()).context("写入代理环境文件失败")?;
+    utils::write_atomic_text(&paths.state_file, &state.to_state_file())
+        .context("写入代理状态失败")?;
+    utils::write_atomic_text(&paths.env_file, &state.export_script())
+        .context("写入代理环境文件失败")?;
 
     let mut auto_shell = None;
     if args.auto {
@@ -131,7 +139,7 @@ fn cmd_start(args: StartArgs) -> Result<()> {
             "auto": args.auto,
             "auto_shell": auto_shell.map(|v| v.as_str().to_string()),
             "script": if args.print_env { Some(export_script) } else { None },
-            "hint": "eval \"$(clash proxy env on)\""
+            "hint": "eval \"$(clash env on)\""
         }));
     }
 
@@ -145,7 +153,7 @@ fn cmd_start(args: StartArgs) -> Result<()> {
         state.host, state.http_port, state.host, state.socks_port
     );
     println!("在当前终端生效:");
-    println!("  eval \"$(clash proxy env on)\"");
+    println!("  eval \"$(clash env on)\"");
     if args.auto {
         println!("已开启新终端自动启用代理。");
     } else {
@@ -273,7 +281,7 @@ fn cmd_stop(args: StopArgs) -> Result<()> {
             "auto_off": args.auto_off,
             "auto_shell": auto_shell.map(|v| v.as_str().to_string()),
             "script": if args.print_env { Some(script) } else { None },
-            "hint": "eval \"$(clash proxy env off)\""
+            "hint": "eval \"$(clash env off)\""
         }));
     }
 
@@ -284,7 +292,7 @@ fn cmd_stop(args: StopArgs) -> Result<()> {
 
     println!("已清理代理配置。");
     println!("在当前终端关闭:");
-    println!("  eval \"$(clash proxy env off)\"");
+    println!("  eval \"$(clash env off)\"");
     if args.auto_off {
         println!("已移除自动启用钩子。");
     }
@@ -320,7 +328,7 @@ fn cmd_status() -> Result<()> {
                 "zsh": zsh_auto,
                 "bash": bash_auto
             },
-            "hint": "eval \"$(clash proxy env on)\""
+            "hint": "eval \"$(clash env on)\""
         }));
     }
 
@@ -328,7 +336,8 @@ fn cmd_status() -> Result<()> {
     println!("HTTP/HTTPS: http://{}:{}", state.host, state.http_port);
     println!("SOCKS5: socks5://{}:{}", state.host, state.socks_port);
     println!("NO_PROXY: {}", state.no_proxy);
-    println!("当前终端生效命令: eval \"$(clash proxy env on)\"");
+    println!("当前终端生效命令: eval \"$(clash env on)\"");
+    println!("桌面系统代理: clash proxy system on   （与 tun 分开）");
 
     println!("自动启用(zsh): {}", if zsh_auto { "开启" } else { "关闭" });
     println!(
@@ -417,23 +426,26 @@ fn cmd_auto(action: AutoAction) -> Result<()> {
             } else {
                 let zsh = shell_hook_installed(ShellKind::Zsh)?;
                 let bash = shell_hook_installed(ShellKind::Bash)?;
+                let fish = shell_hook_installed(ShellKind::Fish)?;
                 if is_json_mode() {
                     return print_json(&serde_json::json!({
                         "ok": true,
                         "action": "proxy.auto.status",
                         "shells": {
                             "zsh": zsh,
-                            "bash": bash
+                            "bash": bash,
+                            "fish": fish
                         }
                     }));
                 }
-                for shell in [ShellKind::Zsh, ShellKind::Bash] {
+                for shell in [ShellKind::Zsh, ShellKind::Bash, ShellKind::Fish] {
                     println!(
                         "{}: {}",
                         shell.as_str(),
                         if match shell {
                             ShellKind::Zsh => zsh,
                             ShellKind::Bash => bash,
+                            ShellKind::Fish => fish,
                         } {
                             "已开启"
                         } else {
@@ -443,6 +455,242 @@ fn cmd_auto(action: AutoAction) -> Result<()> {
                 }
             }
         }
+    }
+    Ok(())
+}
+
+fn cmd_system(action: SystemProxyAction) -> Result<()> {
+    match action {
+        SystemProxyAction::On => cmd_system_on(),
+        SystemProxyAction::Off => cmd_system_off(),
+        SystemProxyAction::Status => cmd_system_status(),
+    }
+}
+
+fn system_proxy_state_path() -> Result<std::path::PathBuf> {
+    Ok(app_paths()?.config_dir.join("system-proxy.state"))
+}
+
+fn current_proxy_state() -> Result<ProxyState> {
+    let paths = app_paths()?;
+    if paths.state_file.exists() {
+        return load_state(&paths.state_file);
+    }
+    let runtime = load_runtime_proxy_defaults(&paths.runtime_config_file);
+    Ok(resolve_start_proxy_state(
+        &StartArgs {
+            host: None,
+            http_port: None,
+            socks_port: None,
+            no_proxy: constants::DEFAULT_NO_PROXY.to_string(),
+            auto: false,
+            shell: None,
+            print_env: false,
+        },
+        runtime,
+    ))
+}
+
+fn loopback_host(host: &str) -> String {
+    if host == "0.0.0.0" || host == "*" || host == "::" {
+        "127.0.0.1".to_string()
+    } else {
+        host.to_string()
+    }
+}
+
+fn cmd_system_on() -> Result<()> {
+    use crate::system_proxy::{
+        SystemProxyBackend, SystemProxyRecord, detect_backend, gnome_current_mode,
+        gnome_enable_commands, list_macos_services, macos_enable_commands, read_record,
+        run_sys_cmd, snapshot_macos_services, unsupported_hint, write_record,
+    };
+
+    let backend = detect_backend().ok_or_else(|| anyhow::anyhow!(unsupported_hint()))?;
+    let proxy = current_proxy_state()?;
+    let host = loopback_host(&proxy.host);
+    let path = system_proxy_state_path()?;
+    let existing = read_record(&path)?;
+
+    match backend {
+        SystemProxyBackend::Gnome => {
+            let previous = existing
+                .as_ref()
+                .filter(|record| record.enabled && record.backend == backend)
+                .and_then(|record| record.previous_gnome_mode.clone())
+                .or_else(|| gnome_current_mode().ok());
+            for cmd in
+                gnome_enable_commands(&host, proxy.http_port, proxy.socks_port, &proxy.no_proxy)
+            {
+                run_sys_cmd(&cmd)?;
+            }
+            write_record(
+                &path,
+                &SystemProxyRecord {
+                    backend,
+                    enabled: true,
+                    host: host.clone(),
+                    http_port: proxy.http_port,
+                    socks_port: proxy.socks_port,
+                    previous_gnome_mode: previous,
+                    previous_macos: Vec::new(),
+                },
+            )?;
+        }
+        SystemProxyBackend::Macos => {
+            let services = list_macos_services()?;
+            if services.is_empty() {
+                bail!("未找到可用网络服务");
+            }
+            if existing.as_ref().is_some_and(|record| {
+                record.enabled && record.backend == backend && record.previous_macos.is_empty()
+            }) {
+                bail!(
+                    "检测到旧版 macOS 系统代理状态，缺少原始代理快照。请先执行 `clash system off` 清理旧接管，再执行 `clash system on` 建立可恢复快照"
+                );
+            }
+            let previous_macos = existing
+                .as_ref()
+                .filter(|record| record.enabled && record.backend == backend)
+                .map(|record| record.previous_macos.clone())
+                .filter(|states| !states.is_empty())
+                .unwrap_or(snapshot_macos_services(&services)?);
+            for cmd in macos_enable_commands(
+                &services,
+                &host,
+                proxy.http_port,
+                proxy.socks_port,
+                &proxy.no_proxy,
+            ) {
+                run_sys_cmd(&cmd)?;
+            }
+            write_record(
+                &path,
+                &SystemProxyRecord {
+                    backend,
+                    enabled: true,
+                    host: host.clone(),
+                    http_port: proxy.http_port,
+                    socks_port: proxy.socks_port,
+                    previous_gnome_mode: None,
+                    previous_macos,
+                },
+            )?;
+        }
+    }
+
+    if is_json_mode() {
+        return print_json(&serde_json::json!({
+            "ok": true,
+            "action": "proxy.system.on",
+            "backend": format!("{:?}", backend).to_lowercase(),
+            "host": host,
+            "http_port": proxy.http_port,
+            "socks_port": proxy.socks_port,
+        }));
+    }
+    println!(
+        "已开启系统代理: http://{}:{}  socks5://{}:{}",
+        host, proxy.http_port, host, proxy.socks_port
+    );
+    println!("关闭: clash proxy system off");
+    println!("全局接管（含不走系统代理的程序）: clash tun on");
+    Ok(())
+}
+
+fn cmd_system_off() -> Result<()> {
+    use crate::system_proxy::{
+        SystemProxyBackend, clear_record, gnome_disable_commands, list_macos_services,
+        macos_disable_commands, macos_restore_commands, read_record, run_sys_cmd,
+    };
+
+    let path = system_proxy_state_path()?;
+    let record = read_record(&path)?;
+    let Some(record) = record else {
+        // 没有本工具的接管记录时绝不修改系统现有代理。
+        if is_json_mode() {
+            return print_json(&serde_json::json!({
+                "ok": true,
+                "action": "proxy.system.off",
+                "changed": false,
+                "reason": "not managed by clash-cli"
+            }));
+        }
+        println!("系统代理未由 clash-cli 接管，无需修改。");
+        return Ok(());
+    };
+    let backend = record.backend;
+
+    match backend {
+        SystemProxyBackend::Gnome => {
+            for cmd in gnome_disable_commands(record.previous_gnome_mode.as_deref()) {
+                run_sys_cmd(&cmd)?;
+            }
+        }
+        SystemProxyBackend::Macos => {
+            let commands = if record.previous_macos.is_empty() {
+                // 兼容旧版状态文件：旧版本没有保存原系统代理，无法精确恢复；
+                // 至少关闭 clash-cli 当时开启的三类代理，避免清状态但代理仍残留。
+                macos_disable_commands(&list_macos_services()?)
+            } else {
+                macos_restore_commands(&record.previous_macos)
+            };
+            for cmd in commands {
+                run_sys_cmd(&cmd)?;
+            }
+        }
+    }
+    clear_record(&path)?;
+
+    if is_json_mode() {
+        return print_json(&serde_json::json!({
+            "ok": true,
+            "action": "proxy.system.off",
+            "backend": format!("{:?}", backend).to_lowercase(),
+        }));
+    }
+    println!("已关闭系统代理。");
+    Ok(())
+}
+
+fn cmd_system_status() -> Result<()> {
+    use crate::system_proxy::{detect_backend, read_record};
+
+    let path = system_proxy_state_path()?;
+    let record = read_record(&path)?;
+    let backend = detect_backend();
+    let enabled = record.as_ref().map(|r| r.enabled).unwrap_or(false);
+
+    if is_json_mode() {
+        return print_json(&serde_json::json!({
+            "ok": true,
+            "action": "proxy.system.status",
+            "backend": backend.map(|b| format!("{:?}", b).to_lowercase()),
+            "enabled": enabled,
+            "record": record,
+        }));
+    }
+
+    match backend {
+        Some(b) => println!("桌面接口: {:?}", b),
+        None => {
+            println!("桌面接口: 未检测到");
+            println!("{}", crate::system_proxy::unsupported_hint());
+            return Ok(());
+        }
+    }
+    if enabled {
+        if let Some(r) = record {
+            println!(
+                "系统代理: 已开启  http://{}:{}  socks5://{}:{}",
+                r.host, r.http_port, r.host, r.socks_port
+            );
+        } else {
+            println!("系统代理: 已开启");
+        }
+    } else {
+        println!("系统代理: 未开启");
+        println!("开启: clash proxy system on");
     }
     Ok(())
 }
@@ -467,8 +715,31 @@ fn unset_script() -> String {
         .to_string()
 }
 
-fn shell_hook_block() -> String {
-    format!("{HOOK_START}\n{SHELL_HOOK_BODY}\n{HOOK_END}\n")
+fn shell_hook_body(shell: ShellKind) -> &'static str {
+    match shell {
+        ShellKind::Bash | ShellKind::Zsh => {
+            r#"if [ -n "$CLASH_CLI_HOME" ] && [ -f "$CLASH_CLI_HOME/proxy.env" ]; then
+  . "$CLASH_CLI_HOME/proxy.env"
+elif [ -n "$XDG_CONFIG_HOME" ] && [ -f "$XDG_CONFIG_HOME/clash-cli/proxy.env" ]; then
+  . "$XDG_CONFIG_HOME/clash-cli/proxy.env"
+elif [ -f "$HOME/.config/clash-cli/proxy.env" ]; then
+  . "$HOME/.config/clash-cli/proxy.env"
+fi"#
+        }
+        ShellKind::Fish => {
+            r#"if test -n "$CLASH_CLI_HOME"; and test -f "$CLASH_CLI_HOME/proxy.env"
+  source "$CLASH_CLI_HOME/proxy.env"
+elif test -n "$XDG_CONFIG_HOME"; and test -f "$XDG_CONFIG_HOME/clash-cli/proxy.env"
+  source "$XDG_CONFIG_HOME/clash-cli/proxy.env"
+elif test -f "$HOME/.config/clash-cli/proxy.env"
+  source "$HOME/.config/clash-cli/proxy.env"
+end"#
+        }
+    }
+}
+
+fn shell_hook_block(shell: ShellKind) -> String {
+    format!("{HOOK_START}\n{}\n{HOOK_END}\n", shell_hook_body(shell))
 }
 
 fn shell_rc_path(shell: ShellKind) -> Result<std::path::PathBuf> {
@@ -476,6 +747,7 @@ fn shell_rc_path(shell: ShellKind) -> Result<std::path::PathBuf> {
     let file = match shell {
         ShellKind::Bash => ".bashrc",
         ShellKind::Zsh => ".zshrc",
+        ShellKind::Fish => ".config/fish/config.fish",
     };
     Ok(home.join(file))
 }
@@ -495,8 +767,9 @@ fn install_shell_hook(shell: ShellKind) -> Result<()> {
     if !updated.ends_with('\n') && !updated.is_empty() {
         updated.push('\n');
     }
-    updated.push_str(&shell_hook_block());
-    fs::write(&rc_path, updated).with_context(|| format!("写入 {} 失败", rc_path.display()))?;
+    updated.push_str(&shell_hook_block(shell));
+    utils::write_atomic_text(&rc_path, &updated)
+        .with_context(|| format!("写入 {} 失败", rc_path.display()))?;
     Ok(())
 }
 
@@ -509,7 +782,8 @@ fn uninstall_shell_hook(shell: ShellKind) -> Result<()> {
     let content =
         fs::read_to_string(&rc_path).with_context(|| format!("读取 {} 失败", rc_path.display()))?;
     let updated = remove_hook_block(&content);
-    fs::write(&rc_path, updated).with_context(|| format!("写入 {} 失败", rc_path.display()))?;
+    utils::write_atomic_text(&rc_path, &updated)
+        .with_context(|| format!("写入 {} 失败", rc_path.display()))?;
     Ok(())
 }
 
@@ -553,7 +827,10 @@ fn detect_shell() -> Result<ShellKind> {
     if shell.ends_with("bash") {
         return Ok(ShellKind::Bash);
     }
-    bail!("无法识别 shell，请用 `--shell bash|zsh` 指定")
+    if shell.ends_with("fish") {
+        return Ok(ShellKind::Fish);
+    }
+    bail!("无法识别 shell，请用 `--shell bash|zsh|fish` 指定")
 }
 
 #[cfg(test)]
@@ -604,6 +881,32 @@ mod tests {
         assert_eq!(state.host, "127.0.0.1");
         assert_eq!(state.http_port, 7890);
         assert_eq!(state.socks_port, 7891);
+    }
+
+    #[test]
+    fn export_script_quotes_shell_metacharacters() {
+        let state = ProxyState {
+            host: "127.0.0.1".into(),
+            http_port: 7890,
+            socks_port: 7891,
+            no_proxy: "localhost; printf should-not-run 'quoted'".into(),
+        };
+        let script = state.export_script();
+        assert!(script.contains("export no_proxy='"));
+        assert!(!script.contains("export no_proxy=localhost;"));
+    }
+
+    #[test]
+    fn state_file_json_roundtrip_preserves_newlines() {
+        let state = ProxyState {
+            host: "127.0.0.1".into(),
+            http_port: 7890,
+            socks_port: 7891,
+            no_proxy: "localhost,example.com\nsecond-line".into(),
+        };
+        let encoded = state.to_state_file();
+        let decoded = ProxyState::from_state_file(&encoded).expect("状态回读失败");
+        assert_eq!(decoded.no_proxy, state.no_proxy);
     }
 
     #[test]

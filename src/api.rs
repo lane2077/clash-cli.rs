@@ -114,21 +114,18 @@ fn cmd_proxies(common: ApiCommonArgs) -> Result<()> {
     let client = build_client(common.timeout_secs)?;
     let ctx = load_api_context(&common)?;
     let response = api_get(&client, &ctx, "/proxies")?;
+    let groups = summarize_proxy_groups(&response);
 
     if is_json_mode() {
         return print_json(&serde_json::json!({
             "ok": true,
             "action": "api.proxies",
+            "groups": groups_to_json(&groups),
             "response": response
         }));
     }
 
-    let count = response
-        .get("proxies")
-        .and_then(|v| v.as_object())
-        .map(|m| m.len())
-        .unwrap_or(0);
-    println!("代理对象数量: {}", count);
+    print!("{}", format_proxy_groups_text(&groups));
     Ok(())
 }
 
@@ -145,22 +142,7 @@ fn cmd_connections(common: ApiCommonArgs) -> Result<()> {
         }));
     }
 
-    let total = response
-        .get("connections")
-        .and_then(|v| v.as_array())
-        .map(|v| v.len())
-        .unwrap_or(0);
-    let down = response
-        .get("downloadTotal")
-        .and_then(|v| v.as_u64())
-        .unwrap_or(0);
-    let up = response
-        .get("uploadTotal")
-        .and_then(|v| v.as_u64())
-        .unwrap_or(0);
-    println!("连接数: {}", total);
-    println!("总下行: {}", down);
-    println!("总上行: {}", up);
+    print!("{}", format_connections_text(&response));
     Ok(())
 }
 
@@ -505,15 +487,7 @@ fn cmd_traffic(common: ApiCommonArgs) -> Result<()> {
         }));
     }
 
-    match snapshot {
-        Some(s) => {
-            let up = s.get("up").and_then(|v| v.as_u64()).unwrap_or(0);
-            let down = s.get("down").and_then(|v| v.as_u64()).unwrap_or(0);
-            println!("上行: {} B/s", up);
-            println!("下行: {} B/s", down);
-        }
-        None => println!("未获取到流量数据。"),
-    }
+    print!("{}", format_traffic_text(snapshot.as_ref()));
     Ok(())
 }
 
@@ -560,6 +534,226 @@ fn cmd_logs(args: ApiLogsArgs) -> Result<()> {
         }
     }
     Ok(())
+}
+
+fn is_proxy_group_type(typ: &str) -> bool {
+    matches!(
+        typ,
+        "Selector" | "URLTest" | "Fallback" | "LoadBalance" | "Relay" | "Smart"
+    )
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ProxyMemberView {
+    name: String,
+    delay_ms: Option<u64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ProxyGroupView {
+    name: String,
+    type_name: String,
+    now: Option<String>,
+    members: Vec<ProxyMemberView>,
+}
+
+fn last_delay_ms(proxy: &JsonValue) -> Option<u64> {
+    let history = proxy.get("history")?.as_array()?;
+    let last = history.last()?;
+    let delay = last.get("delay")?.as_u64()?;
+    if delay == 0 { None } else { Some(delay) }
+}
+
+fn summarize_proxy_groups(response: &JsonValue) -> Vec<ProxyGroupView> {
+    let Some(proxies) = response.get("proxies").and_then(|v| v.as_object()) else {
+        return Vec::new();
+    };
+    let mut groups = Vec::new();
+    for (name, info) in proxies {
+        let type_name = info
+            .get("type")
+            .and_then(|v| v.as_str())
+            .unwrap_or("unknown");
+        if !is_proxy_group_type(type_name) {
+            continue;
+        }
+        let now = info
+            .get("now")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string());
+        let all = info
+            .get("all")
+            .and_then(|v| v.as_array())
+            .cloned()
+            .unwrap_or_default();
+        let members = all
+            .iter()
+            .filter_map(|item| item.as_str().map(|s| s.to_string()))
+            .map(|member_name| {
+                let delay_ms = proxies.get(&member_name).and_then(last_delay_ms);
+                ProxyMemberView {
+                    name: member_name,
+                    delay_ms,
+                }
+            })
+            .collect();
+        groups.push(ProxyGroupView {
+            name: name.clone(),
+            type_name: type_name.to_string(),
+            now,
+            members,
+        });
+    }
+    groups.sort_by(|a, b| a.name.cmp(&b.name));
+    groups
+}
+
+fn groups_to_json(groups: &[ProxyGroupView]) -> JsonValue {
+    JsonValue::Array(
+        groups
+            .iter()
+            .map(|g| {
+                serde_json::json!({
+                    "name": g.name,
+                    "type": g.type_name,
+                    "now": g.now,
+                    "proxies": g.members.iter().map(|m| {
+                        serde_json::json!({
+                            "name": m.name,
+                            "delay_ms": m.delay_ms,
+                        })
+                    }).collect::<Vec<_>>(),
+                })
+            })
+            .collect(),
+    )
+}
+
+fn format_proxy_groups_text(groups: &[ProxyGroupView]) -> String {
+    if groups.is_empty() {
+        return "未发现代理组。内核未启动或订阅尚未生效。\n切节点: clash api proxy-switch --group <组> --proxy <节点>\n"
+            .to_string();
+    }
+    let mut out = String::new();
+    out.push_str("代理组（* 为当前节点）\n");
+    out.push_str("切节点: clash api proxy-switch --group <组> --proxy <节点>\n");
+    for group in groups {
+        let now = group.now.as_deref().unwrap_or("-");
+        let _ = writeln!(out, "\n[{}] {}  当前: {}", group.type_name, group.name, now);
+        if group.members.is_empty() {
+            out.push_str("  （无节点）\n");
+            continue;
+        }
+        for member in &group.members {
+            let mark = if Some(member.name.as_str()) == group.now.as_deref() {
+                "*"
+            } else {
+                " "
+            };
+            match member.delay_ms {
+                Some(ms) => {
+                    let _ = writeln!(out, "  {mark} {}  {ms}ms", member.name);
+                }
+                None => {
+                    let _ = writeln!(out, "  {mark} {}", member.name);
+                }
+            }
+        }
+    }
+    out
+}
+
+fn format_bytes(n: u64) -> String {
+    const KB: f64 = 1024.0;
+    const MB: f64 = KB * 1024.0;
+    const GB: f64 = MB * 1024.0;
+    let x = n as f64;
+    if x < KB {
+        format!("{n} B")
+    } else if x < MB {
+        format!("{:.1} KB", x / KB)
+    } else if x < GB {
+        format!("{:.1} MB", x / MB)
+    } else {
+        format!("{:.2} GB", x / GB)
+    }
+}
+
+fn format_connections_text(response: &JsonValue) -> String {
+    let empty = vec![];
+    let list = response
+        .get("connections")
+        .and_then(|v| v.as_array())
+        .unwrap_or(&empty);
+    let down = response
+        .get("downloadTotal")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0);
+    let up = response
+        .get("uploadTotal")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0);
+    let mut out = format!(
+        "连接数: {}  累计 ↑{} ↓{}\n",
+        list.len(),
+        format_bytes(up),
+        format_bytes(down)
+    );
+    for conn in list.iter().take(20) {
+        let meta = conn.get("metadata");
+        let host = meta
+            .and_then(|m| m.get("host"))
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty())
+            .or_else(|| {
+                meta.and_then(|m| m.get("destinationIP"))
+                    .and_then(|v| v.as_str())
+            })
+            .unwrap_or("-");
+        let port = meta.and_then(|m| m.get("destinationPort")).and_then(|v| {
+            v.as_str()
+                .map(|s| s.to_string())
+                .or_else(|| v.as_u64().map(|n| n.to_string()))
+        });
+        let dest = match port {
+            Some(p) if !p.is_empty() => format!("{host}:{p}"),
+            _ => host.to_string(),
+        };
+        let chain = conn
+            .get("chains")
+            .and_then(|v| v.as_array())
+            .and_then(|a| a.first())
+            .and_then(|v| v.as_str())
+            .unwrap_or("-");
+        let c_up = conn.get("upload").and_then(|v| v.as_u64()).unwrap_or(0);
+        let c_down = conn.get("download").and_then(|v| v.as_u64()).unwrap_or(0);
+        let _ = writeln!(
+            out,
+            "  {dest}  via {chain}  ↑{} ↓{}",
+            format_bytes(c_up),
+            format_bytes(c_down)
+        );
+    }
+    if list.len() > 20 {
+        let _ = writeln!(out, "  … 还有 {} 条", list.len() - 20);
+    }
+    out.push_str("关掉全部: clash api close-connections\n");
+    out
+}
+
+fn format_traffic_text(snapshot: Option<&JsonValue>) -> String {
+    match snapshot {
+        Some(s) => {
+            let up = s.get("up").and_then(|v| v.as_u64()).unwrap_or(0);
+            let down = s.get("down").and_then(|v| v.as_u64()).unwrap_or(0);
+            format!(
+                "瞬时速率  ↑{}/s  ↓{}/s\n（快照，再执行一次即可刷新）\n",
+                format_bytes(up),
+                format_bytes(down)
+            )
+        }
+        None => "未获取到流量。请确认服务已启动: clash service status\n".to_string(),
+    }
 }
 
 fn urlencoded(s: &str) -> String {
@@ -630,5 +824,53 @@ secret: abc
             build_dashboard_url("http://127.0.0.1:9090/"),
             "http://127.0.0.1:9090/ui"
         );
+    }
+
+    #[test]
+    fn summarize_proxy_groups_lists_selector_and_now() {
+        let response = serde_json::json!({
+            "proxies": {
+                "香港": {
+                    "type": "Shadowsocks",
+                    "history": [{"delay": 80}]
+                },
+                "GLOBAL": {
+                    "type": "Selector",
+                    "now": "香港",
+                    "all": ["香港", "DIRECT"]
+                },
+                "DIRECT": { "type": "Direct" }
+            }
+        });
+        let groups = summarize_proxy_groups(&response);
+        assert_eq!(groups.len(), 1);
+        assert_eq!(groups[0].name, "GLOBAL");
+        assert_eq!(groups[0].now.as_deref(), Some("香港"));
+        assert_eq!(groups[0].members[0].delay_ms, Some(80));
+        let text = format_proxy_groups_text(&groups);
+        assert!(text.contains("GLOBAL"));
+        assert!(text.contains("* 香港"));
+        assert!(text.contains("80ms"));
+        assert!(text.contains("proxy-switch"));
+    }
+
+    #[test]
+    fn format_traffic_and_connections_are_readable() {
+        let traffic = format_traffic_text(Some(&serde_json::json!({"up": 2048, "down": 4096})));
+        assert!(traffic.contains("↑") && traffic.contains("↓"));
+        assert!(traffic.contains("KB"));
+        let conns = format_connections_text(&serde_json::json!({
+            "downloadTotal": 1024,
+            "uploadTotal": 512,
+            "connections": [{
+                "upload": 10,
+                "download": 20,
+                "chains": ["香港"],
+                "metadata": { "host": "example.com", "destinationPort": "443" }
+            }]
+        }));
+        assert!(conns.contains("example.com:443"));
+        assert!(conns.contains("via 香港"));
+        assert!(conns.contains("连接数: 1"));
     }
 }

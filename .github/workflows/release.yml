@@ -23,6 +23,14 @@ jobs:
             target: aarch64-unknown-linux-gnu
             bin_name: clash-linux-arm64
             archive_name: clash-linux-arm64.tar.gz
+          - runner: macos-15-intel
+            target: x86_64-apple-darwin
+            bin_name: clash-darwin-amd64
+            archive_name: clash-darwin-amd64.tar.gz
+          - runner: macos-15
+            target: aarch64-apple-darwin
+            bin_name: clash-darwin-arm64
+            archive_name: clash-darwin-arm64.tar.gz
 
     runs-on: ${{ matrix.runner }}
 

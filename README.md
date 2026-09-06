@@ -1,23 +1,24 @@
 # clash-cli.rs
 
-面向 Linux 的 Clash 命令行工具（Rust）。
+面向 Linux 与 macOS 的 Clash 命令行工具（Rust）。
 
 主要能力：
 - `setup init`：一键初始化（内核 + 订阅 + 渲染 + service + tun）
-- `proxy`：终端代理开关与自动注入
+- `sub`：订阅（`profile` 仍是别名）
+- `proxy`：查看代理组并切换节点
+- `system`：桌面系统代理
+- `tun`：TUN 诊断/启停/状态
+- `mode`：出站模式
+- `env`：复制终端环境变量
+- `ui`：仪表板
 - `core`：mihomo 内核安装/升级
-- `service`：systemd 管理
-- `tun`：诊断/启停/状态
-- `profile`：订阅管理与渲染
-- `profile mixin`：mixin.yaml 覆盖规则管理
-- `api`：external-controller 查询与操作
+- `service`：systemd（Linux）/ launchd（macOS）管理
+- `api`：进阶 external-controller 接口
 - `update`：CLI 自身版本更新
-- `ai`：AI 智能分析连接日志并优化路由规则
 
 ## 系统要求
-- Linux（systemd）
-- `curl`、`tar`
-- root/sudo 权限
+- Linux（systemd）或 macOS（launchd）
+- 全局 TUN 需要 root/sudo
 - 支持架构：`amd64`、`arm64`
 
 ## 一键安装并初始化（推荐）
@@ -45,7 +46,11 @@ curl -fsSL https://raw.githubusercontent.com/lane2077/clash-cli.rs/main/scripts/
 安装后手动初始化：
 
 ```bash
+# Linux（或 macOS 需要全局 TUN / LaunchDaemon）
 sudo env CLASH_CLI_HOME=/etc/clash-cli clash setup init --profile-url "https://example.com/sub.yaml"
+
+# macOS 用户级 LaunchAgent（不接管全局流量）
+clash setup init --profile-url "https://example.com/sub.yaml" --no-tun
 ```
 
 ## 更新 CLI
@@ -59,30 +64,39 @@ clash update run             # 下载并替换
 curl -fsSL https://raw.githubusercontent.com/lane2077/clash-cli.rs/main/scripts/install.sh | bash -s -- --skip-setup
 ```
 
-## 常用命令
+## 怎么用（人看中文，管道自动 JSON）
+
+终端里直接跑，输出中文。被脚本/管道调用时自动变成 JSON，不必加 `--json`。只有在终端里想看 JSON 才用 `--json`；管道里想看中文用 `--text`。
+
+`eval "$(clash env on)"` 始终是 shell 脚本。
 
 ```bash
-# 基础
-clash --help
-clash setup init --help
+# 和 Clash Verge 菜单同一套词
+clash ui                                        # 仪表板
+clash mode                                      # 出站模式（规则/全局/直连）
+clash sub list
+clash sub add --name main --url "https://example.com/sub.yaml" --use-profile
+clash sub update                                # 拉取最新并生效
+clash sub use --name main --apply               # 切换订阅并生效
+clash proxy                                     # 代理组与当前节点
+clash proxy switch --group Proxy --proxy "香港"
+clash system on                                 # 桌面系统代理（浏览器等）
+clash tun on                                    # 全局接管
+eval "$(clash env on)"                          # 仅当前终端
 
-# 代理与服务
-clash proxy start
-eval "$(clash proxy env on)"
-clash tun status --name clash-mihomo
-clash api ui-url
+# 本地覆盖订阅原文
+clash sub mixin set --key tun.enable --value true
 
-# Mixin 规则管理
-clash profile mixin show
-clash profile mixin set --key tun.enable --value true
-clash profile mixin unset --key tun.enable
-clash profile mixin reset
-
-# AI 规则优化
-clash ai models --api-base https://your-api.com/v1
-clash ai rules --api-base https://your-api.com/v1 --model gpt-4o
-clash ai rules --dry-run    # 仅分析不修改
+# 旧命令仍可用：profile / api proxies / api proxy-switch / proxy env / proxy system
 ```
+
+## 开发调试
+
+```bash
+cargo test
+```
+
+说明见 `AGENTS.md`。
 
 ## 一键卸载
 

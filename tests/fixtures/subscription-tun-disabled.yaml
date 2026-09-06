@@ -1,0 +1,7 @@
+proxies: []
+proxy-groups: []
+rules:
+  - MATCH,DIRECT
+tun:
+  enable: false
+  auto-redirect: false

@@ -36,3 +36,24 @@ jobs:
 
       - name: Release 构建
         run: cargo build --release
+
+  macos-check:
+    runs-on: macos-15
+
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+
+      - name: 安装 Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+
+      - name: 缓存 Cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: macOS 编译检查
+        run: cargo check --all-targets
+
+      - name: macOS 格式检查
+        run: cargo fmt --check

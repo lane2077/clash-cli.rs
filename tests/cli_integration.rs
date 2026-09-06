@@ -38,9 +38,27 @@ fn help_should_contain_main_commands() {
         .expect("执行 --help 失败");
     assert!(output.status.success());
     let stdout = String::from_utf8_lossy(&output.stdout);
-    for cmd in ["proxy", "core", "service", "tun", "profile", "api"] {
+    for cmd in [
+        "sub", "system", "mode", "env", "ui", "tun", "proxy", "profile", "api", "core", "service",
+    ] {
         assert!(stdout.contains(cmd), "帮助信息缺少子命令: {cmd}");
     }
+    assert!(
+        stdout.contains("代理组") || stdout.contains("节点"),
+        "proxy 帮助应说明代理组/节点: {stdout}"
+    );
+    assert!(
+        !stdout.contains("管理终端代理"),
+        "顶层 proxy 不应再表示终端环境变量: {stdout}"
+    );
+    assert!(
+        !stdout.contains("inspect"),
+        "帮助不应再提供 inspect 子命令: {stdout}"
+    );
+    assert!(
+        !stdout.contains("AI 入口") && !stdout.contains("clash --json inspect"),
+        "帮助不应把 inspect 当成 AI 入口: {stdout}"
+    );
 }
 
 #[test]
@@ -193,6 +211,119 @@ fn json_mixin_reset_should_clear() {
     let text = String::from_utf8_lossy(&output.stdout);
     let value: serde_json::Value = serde_json::from_str(&text).expect("输出不是合法 JSON");
     assert_eq!(value["exists"], false);
+
+    let _ = fs::remove_dir_all(&home);
+}
+
+fn write_profile_without_tun(home: &Path, extra: &str) {
+    let profiles = home.join("profiles");
+    fs::create_dir_all(&profiles).expect("创建 profiles 目录失败");
+    let index = serde_json::json!({
+        "active": "main",
+        "profiles": [{
+            "name": "main",
+            "url": "https://example.com/sub.yaml",
+            "file": "main.yaml",
+            "created_at": 1,
+            "updated_at": 1
+        }]
+    });
+    fs::write(
+        profiles.join("index.json"),
+        serde_json::to_vec_pretty(&index).expect("序列化索引失败"),
+    )
+    .expect("写入索引失败");
+    fs::write(
+        profiles.join("main.yaml"),
+        format!("proxies: []\nproxy-groups: []\nrules:\n  - MATCH,DIRECT\n{extra}"),
+    )
+    .expect("写入 profile 失败");
+}
+
+fn runtime_tun_enable(home: &Path) -> Option<bool> {
+    let text = fs::read_to_string(home.join("runtime").join("config.yaml"))
+        .expect("读取 runtime/config.yaml 失败");
+    let root: serde_yaml::Value = serde_yaml::from_str(&text).expect("解析 runtime YAML 失败");
+    root.get("tun")
+        .and_then(|t| t.get("enable"))
+        .and_then(|v| v.as_bool())
+}
+
+#[test]
+fn profile_render_keeps_tun_overlay_after_subscription_omits_tun() {
+    let home = temp_home("render_tun_overlay");
+    write_profile_without_tun(&home, "");
+
+    let mixin_out = run_with_home(
+        &home,
+        &[
+            "--json",
+            "profile",
+            "mixin",
+            "set",
+            "--key",
+            "tun.enable",
+            "--value",
+            "true",
+        ],
+    );
+    assert!(
+        mixin_out.status.success(),
+        "mixin set 失败: {}",
+        String::from_utf8_lossy(&mixin_out.stderr)
+    );
+
+    let mixin_redirect = run_with_home(
+        &home,
+        &[
+            "--json",
+            "profile",
+            "mixin",
+            "set",
+            "--key",
+            "tun.auto-redirect",
+            "--value",
+            "true",
+        ],
+    );
+    assert!(mixin_redirect.status.success());
+
+    let first_render = run_with_home(&home, &["--json", "profile", "render"]);
+    assert!(
+        first_render.status.success(),
+        "第一次 render 失败: stdout={} stderr={}",
+        String::from_utf8_lossy(&first_render.stdout),
+        String::from_utf8_lossy(&first_render.stderr)
+    );
+    let first_json: serde_json::Value =
+        serde_json::from_str(&String::from_utf8_lossy(&first_render.stdout))
+            .expect("第一次 render 不是 JSON");
+    assert_eq!(first_json["ok"], true);
+    assert_eq!(runtime_tun_enable(&home), Some(true));
+
+    write_profile_without_tun(&home, "mode: rule\n");
+
+    let second_render = run_with_home(&home, &["--json", "profile", "render"]);
+    assert!(
+        second_render.status.success(),
+        "第二次 render 失败: stdout={} stderr={}",
+        String::from_utf8_lossy(&second_render.stdout),
+        String::from_utf8_lossy(&second_render.stderr)
+    );
+    let second_json: serde_json::Value =
+        serde_json::from_str(&String::from_utf8_lossy(&second_render.stdout))
+            .expect("第二次 render 不是 JSON");
+    assert_eq!(second_json["ok"], true);
+    assert_eq!(runtime_tun_enable(&home), Some(true));
+
+    let text = fs::read_to_string(home.join("runtime").join("config.yaml")).unwrap();
+    let root: serde_yaml::Value = serde_yaml::from_str(&text).unwrap();
+    assert_eq!(
+        root.get("tun")
+            .and_then(|t| t.get("auto-redirect"))
+            .and_then(|v| v.as_bool()),
+        Some(true)
+    );
 
     let _ = fs::remove_dir_all(&home);
 }

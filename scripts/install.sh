@@ -18,6 +18,8 @@ usage() {
 用法:
   scripts/install.sh [选项]
 
+支持 Linux 与 macOS（amd64/arm64）。
+
 选项:
   --repo OWNER/REPO        GitHub 仓库，默认 lane2077/clash-cli.rs
   --version TAG            CLI 版本，默认 latest（示例: v0.1.0）
@@ -25,7 +27,7 @@ usage() {
   --bin-path PATH          clash 安装路径，默认 /usr/local/bin/clash
   --profile-url URL        订阅地址（提供后会自动执行 setup init）
   --profile-name NAME      profile 名称，默认 main
-  --service-name NAME      systemd 服务名，默认 clash-mihomo
+  --service-name NAME      服务名（systemd/launchd），默认 clash-mihomo
   --home PATH              CLASH_CLI_HOME，默认 /etc/clash-cli
   --workdir PATH           service 工作目录，默认 /var/lib/clash-cli
   --skip-setup             仅安装 clash 二进制，不执行 setup init
@@ -92,10 +94,14 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
-if [[ "$(uname -s)" != "Linux" ]]; then
-  echo "仅支持 Linux。" >&2
-  exit 1
-fi
+UNAME_S="$(uname -s)"
+case "${UNAME_S}" in
+  Linux|Darwin) ;;
+  *)
+    echo "仅支持 Linux 与 macOS，当前: ${UNAME_S}" >&2
+    exit 1
+    ;;
+esac
 
 if ! command -v curl >/dev/null 2>&1; then
   echo "未检测到 curl，请先安装 curl。" >&2
@@ -117,17 +123,27 @@ else
   SUDO=""
 fi
 
+OS_TAG="linux"
+if [[ "${UNAME_S}" == "Darwin" ]]; then
+  OS_TAG="darwin"
+  if [[ "${CLASH_HOME}" == "/etc/clash-cli" && "$(id -u)" -ne 0 ]]; then
+    CLASH_HOME="${HOME}/.config/clash-cli"
+  fi
+  if [[ "${WORKDIR}" == "/var/lib/clash-cli" ]]; then
+    WORKDIR="${CLASH_HOME}/runtime"
+  fi
+fi
 case "$(uname -m)" in
   x86_64|amd64)
-    ASSET="clash-linux-amd64.tar.gz"
-    BIN_NAME="clash-linux-amd64"
+    ASSET="clash-${OS_TAG}-amd64.tar.gz"
+    BIN_NAME="clash-${OS_TAG}-amd64"
     ;;
   aarch64|arm64)
-    ASSET="clash-linux-arm64.tar.gz"
-    BIN_NAME="clash-linux-arm64"
+    ASSET="clash-${OS_TAG}-arm64.tar.gz"
+    BIN_NAME="clash-${OS_TAG}-arm64"
     ;;
   *)
-    echo "当前仅提供 Linux amd64/arm64 发布包，当前架构: $(uname -m)" >&2
+    echo "当前仅提供 ${OS_TAG} amd64/arm64 发布包，当前架构: $(uname -m)" >&2
     exit 1
     ;;
 esac
@@ -137,10 +153,11 @@ if [[ "${VERSION}" != "latest" && "${VERSION}" != v* ]]; then
 fi
 
 build_release_path() {
+  local file="$1"
   if [[ "${VERSION}" == "latest" ]]; then
-    echo "https://github.com/${REPO}/releases/latest/download/${ASSET}"
+    echo "https://github.com/${REPO}/releases/latest/download/${file}"
   else
-    echo "https://github.com/${REPO}/releases/download/${VERSION}/${ASSET}"
+    echo "https://github.com/${REPO}/releases/download/${VERSION}/${file}"
   fi
 }
 
@@ -160,12 +177,14 @@ add_mirror_prefix() {
   esac
 }
 
-RELEASE_URL="$(build_release_path)"
+RELEASE_URL="$(build_release_path "${ASSET}")"
+CHECKSUM_URL="$(build_release_path "SHA256SUMS.txt")"
 DOWNLOAD_CANDIDATES=()
 case "${MIRROR}" in
   auto)
-    DOWNLOAD_CANDIDATES+=("$(add_mirror_prefix "${RELEASE_URL}" ghfast)")
+    # 官方源优先；镜像只作为可用性回退。
     DOWNLOAD_CANDIDATES+=("$(add_mirror_prefix "${RELEASE_URL}" github)")
+    DOWNLOAD_CANDIDATES+=("$(add_mirror_prefix "${RELEASE_URL}" ghfast)")
     ;;
   ghfast|github)
     DOWNLOAD_CANDIDATES+=("$(add_mirror_prefix "${RELEASE_URL}" "${MIRROR}")")
@@ -194,6 +213,34 @@ done
 
 if [[ -z "${DOWNLOADED_URL}" ]]; then
   echo "下载失败，请检查网络或仓库发布文件。" >&2
+  exit 1
+fi
+
+CHECKSUM_PATH="${TMP_DIR}/SHA256SUMS.txt"
+echo "从 GitHub 官方发布读取 SHA256: ${CHECKSUM_URL}"
+if ! curl -fsSL --connect-timeout 15 --retry 2 --retry-delay 1 -o "${CHECKSUM_PATH}" "${CHECKSUM_URL}"; then
+  echo "无法从 GitHub 官方发布获取 SHA256SUMS.txt，已拒绝安装未验证二进制。" >&2
+  exit 1
+fi
+EXPECTED_SHA256="$(awk -v target="${ASSET}" '{ name=$2; sub(/^\*/, "", name); if (name == target) { print $1; exit } }' "${CHECKSUM_PATH}")"
+if [[ ! "${EXPECTED_SHA256}" =~ ^[0-9A-Fa-f]{64}$ ]]; then
+  echo "SHA256SUMS.txt 中未找到 ${ASSET} 的有效摘要，已拒绝安装。" >&2
+  exit 1
+fi
+if command -v sha256sum >/dev/null 2>&1; then
+  ACTUAL_SHA256="$(sha256sum "${ARCHIVE_PATH}" | awk '{print $1}')"
+elif command -v shasum >/dev/null 2>&1; then
+  ACTUAL_SHA256="$(shasum -a 256 "${ARCHIVE_PATH}" | awk '{print $1}')"
+else
+  echo "缺少 sha256sum/shasum，无法校验下载文件。" >&2
+  exit 1
+fi
+ACTUAL_SHA256_LOWER="$(printf '%s' "${ACTUAL_SHA256}" | tr '[:upper:]' '[:lower:]')"
+EXPECTED_SHA256_LOWER="$(printf '%s' "${EXPECTED_SHA256}" | tr '[:upper:]' '[:lower:]')"
+if [[ "${ACTUAL_SHA256_LOWER}" != "${EXPECTED_SHA256_LOWER}" ]]; then
+  echo "SHA256 校验失败，已拒绝安装。" >&2
+  echo "expected=${EXPECTED_SHA256}" >&2
+  echo "actual=${ACTUAL_SHA256}" >&2
   exit 1
 fi
 

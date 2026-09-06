@@ -2,13 +2,12 @@ use std::fs;
 use std::path::Path;
 
 use anyhow::{Result, bail};
-use serde_yaml::{Mapping, Value};
 
 use crate::output::{is_json_mode, print_json};
 use crate::paths::app_paths;
 use crate::utils::command_exists;
 
-use super::config::{bool_field, key_value, load_or_init_config, string_field};
+use super::config::{bool_field, key_value, string_field};
 use super::detect::detect_bridge_interfaces;
 use super::privilege::{
     CAP_NET_ADMIN_BIT, CAP_NET_RAW_BIT, PrivilegeCheck, ensure_tun_doctor_privileges_or_delegate,
@@ -30,7 +29,7 @@ struct CheckItem {
 }
 
 pub(super) fn cmd_doctor() -> Result<()> {
-    super::ensure_linux_host()?;
+    crate::utils::ensure_supported_host()?;
     if ensure_tun_doctor_privileges_or_delegate()? == PrivilegeCheck::Delegated {
         return Ok(());
     }
@@ -39,27 +38,7 @@ pub(super) fn cmd_doctor() -> Result<()> {
     }
 
     let paths = app_paths()?;
-    let mut checks = vec![
-        check_tun_device(),
-        check_capability(
-            CAP_NET_ADMIN_BIT,
-            "CAP_NET_ADMIN",
-            "建议使用 systemd AmbientCapabilities 或 root 运行",
-        ),
-        check_capability(
-            CAP_NET_RAW_BIT,
-            "CAP_NET_RAW",
-            "建议补充 CAP_NET_RAW，避免部分流量处理受限",
-        ),
-        check_backend(),
-        check_sysctl_value(
-            "/proc/sys/net/ipv4/ip_forward",
-            "内核转发(net.ipv4.ip_forward)",
-            "1",
-            "可执行: sudo sysctl -w net.ipv4.ip_forward=1",
-        ),
-        check_rp_filter(),
-    ];
+    let mut checks = darwin_or_linux_checks();
 
     let (config_checks, config_tun_enable, config_auto_redirect) =
         check_config(&paths.runtime_config_file);
@@ -72,47 +51,9 @@ pub(super) fn cmd_doctor() -> Result<()> {
         ));
     }
 
-    // 检测 Docker 桥接接口与 tun 配置排除情况
     let bridge_ifaces = detect_bridge_interfaces();
-    if !bridge_ifaces.is_empty() {
-        let tun = key_value(
-            &load_or_init_config(&paths.runtime_config_file)
-                .unwrap_or(Value::Mapping(Mapping::new())),
-            "tun",
-        )
-        .cloned();
-        let has_include = tun
-            .as_ref()
-            .and_then(|t| t.as_mapping())
-            .and_then(|m| m.get(Value::String("include-interface".to_string())))
-            .and_then(|v| v.as_sequence())
-            .is_some_and(|s| !s.is_empty());
-        let has_exclude = tun
-            .as_ref()
-            .and_then(|t| t.as_mapping())
-            .and_then(|m| m.get(Value::String("exclude-interface".to_string())))
-            .and_then(|v| v.as_sequence())
-            .is_some_and(|s| !s.is_empty());
-        if has_include || has_exclude {
-            checks.push(pass(
-                "Docker 桥接隔离",
-                &format!(
-                    "检测到 {} 个桥接接口 ({})，tun 配置已包含接口过滤",
-                    bridge_ifaces.len(),
-                    bridge_ifaces.join(", ")
-                ),
-            ));
-        } else {
-            checks.push(warn(
-                "Docker 桥接隔离",
-                &format!(
-                    "检测到 {} 个桥接接口 ({})，但 tun 未配置 include/exclude-interface",
-                    bridge_ifaces.len(),
-                    bridge_ifaces.join(", ")
-                ),
-                "建议执行 `clash tun on` 自动检测并配置接口白名单",
-            ));
-        }
+    if let Some(note) = docker_bridge_dataplane_note(&bridge_ifaces, config_auto_redirect) {
+        checks.push(check_from_note(note));
     }
 
     let (pass_count, warn_count, fail_count) = if is_json_mode() {
@@ -161,6 +102,51 @@ pub(super) fn cmd_doctor() -> Result<()> {
         println!("tun 诊断通过，当前环境可用于 tun 模式。");
     }
     Ok(())
+}
+
+fn darwin_or_linux_checks() -> Vec<CheckItem> {
+    if crate::utils::is_macos() {
+        return vec![
+            pass(
+                "TUN 设备",
+                "macOS 使用 utun，由 mihomo auto-route 创建（接管流量通常需要 root）",
+            ),
+            if crate::utils::is_root_user() {
+                pass("权限", "当前为 root")
+            } else {
+                warn(
+                    "权限",
+                    "当前非 root，tun on 可能无法创建 utun / 改路由",
+                    "使用 sudo clash tun on",
+                )
+            },
+            pass(
+                "数据面",
+                "Darwin 不使用 nft/iptables；成功不依赖 clash_cli_tun 表",
+            ),
+        ];
+    }
+    vec![
+        check_tun_device(),
+        check_capability(
+            CAP_NET_ADMIN_BIT,
+            "CAP_NET_ADMIN",
+            "建议使用 systemd AmbientCapabilities 或 root 运行",
+        ),
+        check_capability(
+            CAP_NET_RAW_BIT,
+            "CAP_NET_RAW",
+            "建议补充 CAP_NET_RAW，避免部分流量处理受限",
+        ),
+        check_backend(),
+        check_sysctl_value(
+            "/proc/sys/net/ipv4/ip_forward",
+            "内核转发(net.ipv4.ip_forward)",
+            "1",
+            "可执行: sudo sysctl -w net.ipv4.ip_forward=1",
+        ),
+        check_rp_filter(),
+    ]
 }
 
 fn check_tun_device() -> CheckItem {
@@ -384,6 +370,61 @@ fn check_config(config_path: &Path) -> (Vec<CheckItem>, bool, bool) {
     (items, tun_enable, auto_redirect)
 }
 
+#[derive(Debug, Clone)]
+pub struct DoctorCheckView {
+    pub name: &'static str,
+    pub level: &'static str,
+    pub message: String,
+    pub suggestion: Option<String>,
+}
+
+/// Docker 桥接只作提示：数据面由 mihomo auto-redirect 管理，不建议 CLI 配 include/exclude-interface。
+pub fn docker_bridge_dataplane_note(
+    bridge_ifaces: &[String],
+    auto_redirect: bool,
+) -> Option<DoctorCheckView> {
+    if bridge_ifaces.is_empty() {
+        return None;
+    }
+    let ifaces = bridge_ifaces.join(", ");
+    if auto_redirect {
+        return Some(DoctorCheckView {
+            name: "Docker 桥接隔离",
+            level: "PASS",
+            message: format!(
+                "检测到 {} 个桥接接口 ({})，auto-redirect 由 mihomo 管理数据面",
+                bridge_ifaces.len(),
+                ifaces
+            ),
+            suggestion: None,
+        });
+    }
+    Some(DoctorCheckView {
+        name: "Docker 桥接隔离",
+        level: "WARN",
+        message: format!(
+            "检测到 {} 个桥接接口 ({})，当前未开启 auto-redirect",
+            bridge_ifaces.len(),
+            ifaces
+        ),
+        suggestion: Some("建议开启 tun.auto-redirect，由 mihomo 管理数据面规则".to_string()),
+    })
+}
+
+fn check_from_note(note: DoctorCheckView) -> CheckItem {
+    let level = match note.level {
+        "PASS" => CheckLevel::Pass,
+        "FAIL" => CheckLevel::Fail,
+        _ => CheckLevel::Warn,
+    };
+    CheckItem {
+        name: note.name,
+        level,
+        message: note.message,
+        suggestion: note.suggestion,
+    }
+}
+
 fn pass(name: &'static str, message: &str) -> CheckItem {
     CheckItem {
         name,
@@ -450,5 +491,46 @@ fn check_level_str(level: CheckLevel) -> &'static str {
         CheckLevel::Pass => "PASS",
         CheckLevel::Warn => "WARN",
         CheckLevel::Fail => "FAIL",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn blob(note: &DoctorCheckView) -> String {
+        format!(
+            "{} {} {}",
+            note.message,
+            note.suggestion.as_deref().unwrap_or(""),
+            note.name
+        )
+    }
+
+    #[test]
+    fn docker_bridges_with_auto_redirect_must_not_recommend_include_exclude() {
+        let note =
+            docker_bridge_dataplane_note(&["docker0".to_string()], true).expect("应给出桥接提示");
+        let text = blob(&note);
+        assert!(!text.contains("include-interface"));
+        assert!(!text.contains("exclude-interface"));
+        assert_eq!(note.level, "PASS");
+    }
+
+    #[test]
+    fn docker_bridges_without_auto_redirect_must_not_recommend_include_exclude() {
+        let note =
+            docker_bridge_dataplane_note(&["br-abc".to_string(), "docker0".to_string()], false)
+                .expect("应给出桥接提示");
+        let text = blob(&note);
+        assert!(!text.contains("include-interface"));
+        assert!(!text.contains("exclude-interface"));
+        assert!(!text.contains("接口白名单"));
+    }
+
+    #[test]
+    fn empty_bridge_list_emits_no_note() {
+        assert!(docker_bridge_dataplane_note(&[], true).is_none());
+        assert!(docker_bridge_dataplane_note(&[], false).is_none());
     }
 }

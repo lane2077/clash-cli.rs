@@ -7,6 +7,7 @@ use crate::auto_sudo;
 use crate::cli::{MixinCommand, MixinSetArgs};
 use crate::output::{is_json_mode, print_json};
 use crate::paths::app_paths;
+use crate::utils;
 
 pub fn run(command: MixinCommand) -> Result<()> {
     let retry_command = command.clone();
@@ -175,7 +176,7 @@ fn cmd_reset() -> Result<()> {
 
 // --- helpers ---
 
-fn load_mixin_or_empty(path: &std::path::Path) -> Result<Value> {
+pub(crate) fn load_mixin_or_empty(path: &std::path::Path) -> Result<Value> {
     if !path.exists() {
         return Ok(Value::Mapping(serde_yaml::Mapping::new()));
     }
@@ -186,13 +187,14 @@ fn load_mixin_or_empty(path: &std::path::Path) -> Result<Value> {
     Ok(val)
 }
 
-fn save_mixin(path: &std::path::Path, root: &Value) -> Result<()> {
+pub(crate) fn save_mixin(path: &std::path::Path, root: &Value) -> Result<()> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)
             .with_context(|| format!("创建目录失败: {}", parent.display()))?;
     }
     let content = serde_yaml::to_string(root).context("序列化 mixin.yaml 失败")?;
-    fs::write(path, content).with_context(|| format!("写入 mixin.yaml 失败: {}", path.display()))
+    utils::write_atomic_text(path, &content)
+        .with_context(|| format!("写入 mixin.yaml 失败: {}", path.display()))
 }
 
 fn parse_yaml_value(raw: &str) -> Value {

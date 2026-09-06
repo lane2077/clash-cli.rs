@@ -21,3 +21,5 @@ pub const DEFAULT_EXTERNAL_UI: &str = "ui";
 pub const DEFAULT_EXTERNAL_UI_NAME: &str = "metacubexd";
 pub const DEFAULT_EXTERNAL_UI_URL: &str =
     "https://ghfast.top/https://github.com/MetaCubeX/metacubexd/archive/refs/heads/gh-pages.zip";
+pub const METACUBEXD_GITHUB_ZIP: &str =
+    "https://github.com/MetaCubeX/metacubexd/archive/refs/heads/gh-pages.zip";

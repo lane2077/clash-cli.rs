@@ -1,20 +1,22 @@
 use std::env;
 use std::fs;
 use std::fs::File;
-use std::io::{self, Write};
+use std::io::{self, Read, Write};
 use std::os::unix::fs::{PermissionsExt, symlink};
 use std::path::Path;
+use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, bail};
 use flate2::read::GzDecoder;
 use serde::Deserialize;
+use sha2::{Digest, Sha256};
 
 use crate::cli::{Amd64Variant, CoreCommand, CoreInstallArgs, CoreUpgradeArgs, MirrorSource};
 use crate::http::{build_http_client, download_candidates, download_to_file};
 use crate::output::{is_json_mode, print_json};
 use crate::paths::app_paths;
-use crate::utils::ensure_linux_host;
+use crate::utils::{command_exists, is_root_user, write_atomic_text};
 
 const GITHUB_REPO: &str = "MetaCubeX/mihomo";
 const RELEASES_LATEST_API: &str = "https://api.github.com/repos/MetaCubeX/mihomo/releases/latest";
@@ -28,9 +30,11 @@ struct GitHubRelease {
 }
 
 #[derive(Debug, Clone, Deserialize)]
-struct GitHubAsset {
+pub(crate) struct GitHubAsset {
     name: String,
     browser_download_url: String,
+    #[serde(default)]
+    digest: Option<String>,
 }
 
 #[derive(Debug)]
@@ -56,7 +60,7 @@ pub fn run(command: CoreCommand) -> Result<()> {
 }
 
 fn cmd_install(args: CoreInstallArgs) -> Result<()> {
-    ensure_linux_host()?;
+    crate::utils::ensure_supported_host()?;
     let request = CoreInstallRequest {
         version: args.version,
         mirror: args.mirror,
@@ -67,7 +71,7 @@ fn cmd_install(args: CoreInstallArgs) -> Result<()> {
 }
 
 fn cmd_upgrade(args: CoreUpgradeArgs) -> Result<()> {
-    ensure_linux_host()?;
+    crate::utils::ensure_supported_host()?;
     let request = CoreInstallRequest {
         version: "latest".to_string(),
         mirror: args.mirror,
@@ -145,6 +149,7 @@ fn install_mihomo_core(request: CoreInstallRequest) -> Result<()> {
     fs::create_dir_all(&version_dir).context("创建版本目录失败")?;
 
     if installed_binary.exists() && !request.force {
+        ensure_selinux_executable_label(&installed_binary)?;
         point_current_core(&paths.core_current_link, &installed_binary)?;
         write_core_meta(
             &paths.core_meta_file,
@@ -193,6 +198,13 @@ fn install_mihomo_core(request: CoreInstallRequest) -> Result<()> {
         None => bail!("下载失败，已尝试所有源:\n{}", errors.join("\n")),
     };
 
+    let expected_sha256 = asset_sha256(&asset)?;
+    let actual_sha256 = sha256_hex(&temp_gz_path)?;
+    if !actual_sha256.eq_ignore_ascii_case(&expected_sha256) {
+        let _ = fs::remove_file(&temp_gz_path);
+        bail!("mihomo 下载校验失败: expected={expected_sha256}, actual={actual_sha256}");
+    }
+
     decompress_gzip_to_file(&temp_gz_path, &temp_bin_path)?;
     set_executable(&temp_bin_path)?;
 
@@ -200,6 +212,7 @@ fn install_mihomo_core(request: CoreInstallRequest) -> Result<()> {
         fs::remove_file(&installed_binary).context("替换旧内核失败")?;
     }
     fs::rename(&temp_bin_path, &installed_binary).context("落盘新内核失败")?;
+    ensure_selinux_executable_label(&installed_binary)?;
 
     if temp_gz_path.exists() {
         fs::remove_file(&temp_gz_path).ok();
@@ -226,6 +239,41 @@ fn install_mihomo_core(request: CoreInstallRequest) -> Result<()> {
     Ok(())
 }
 
+/// Fedora 等启用 SELinux 的系统不会把 `/etc` 下的文件自动视为系统程序。
+/// systemd 从 `core/mihomo` 软链接启动时，目标文件必须继承正常系统程序
+/// 的标签，否则即使 unit 已授予网络能力，TUN 创建仍会被拒绝。
+fn ensure_selinux_executable_label(path: &Path) -> Result<()> {
+    if std::env::consts::OS != "linux" || !is_root_user() || !command_exists("getenforce") {
+        return Ok(());
+    }
+    let output = Command::new("getenforce")
+        .output()
+        .context("检测 SELinux 状态失败")?;
+    if !output.status.success() || String::from_utf8_lossy(&output.stdout).trim() == "Disabled" {
+        return Ok(());
+    }
+    if !command_exists("chcon") {
+        bail!("SELinux 已启用，但系统缺少 chcon，无法设置 Mihomo 可执行文件标签");
+    }
+    let reference = Path::new("/usr/bin/env");
+    if !reference.exists() {
+        bail!(
+            "SELinux 已启用，但缺少标签参考文件: {}",
+            reference.display()
+        );
+    }
+    let status = Command::new("chcon")
+        .arg("--reference")
+        .arg(reference)
+        .arg(path)
+        .status()
+        .with_context(|| format!("设置 SELinux 可执行文件标签失败: {}", path.display()))?;
+    if !status.success() {
+        bail!("设置 SELinux 可执行文件标签失败: {}", path.display());
+    }
+    Ok(())
+}
+
 fn fetch_release(client: &reqwest::blocking::Client, version: &str) -> Result<GitHubRelease> {
     let url = if version == "latest" {
         RELEASES_LATEST_API.to_string()
@@ -243,31 +291,47 @@ fn fetch_release(client: &reqwest::blocking::Client, version: &str) -> Result<Gi
     response.json::<GitHubRelease>().context("解析发布信息失败")
 }
 
+fn host_os_tag() -> Result<&'static str> {
+    match env::consts::OS {
+        "linux" => Ok("linux"),
+        "macos" => Ok("darwin"),
+        other => bail!("暂不支持的系统: {other}"),
+    }
+}
+
 fn select_release_asset(
     assets: &[GitHubAsset],
     amd64_variant: Amd64Variant,
 ) -> Result<GitHubAsset> {
-    let arch = env::consts::ARCH;
-    let mut linux_assets: Vec<GitHubAsset> = assets
+    select_release_asset_for(host_os_tag()?, env::consts::ARCH, assets, amd64_variant)
+}
+
+pub(crate) fn select_release_asset_for(
+    os_tag: &str,
+    arch: &str,
+    assets: &[GitHubAsset],
+    amd64_variant: Amd64Variant,
+) -> Result<GitHubAsset> {
+    let os_tag = os_tag.to_lowercase();
+    let mut matched: Vec<GitHubAsset> = assets
         .iter()
         .filter(|asset| {
             let name = asset.name.to_lowercase();
-            name.contains("linux") && name.ends_with(".gz")
+            name.contains(&os_tag) && name.ends_with(".gz") && !name.contains("cgo")
         })
         .cloned()
         .collect();
 
-    if linux_assets.is_empty() {
-        bail!("{GITHUB_REPO} 当前版本未找到 Linux 资产");
+    if matched.is_empty() {
+        bail!("{GITHUB_REPO} 当前版本未找到 {os_tag} 资产");
     }
 
-    linux_assets.sort_by(|a, b| a.name.cmp(&b.name));
+    matched.sort_by(|a, b| a.name.cmp(&b.name));
 
-    // 资产匹配单独抽离，后续可替换成可配置规则。
     match arch {
-        "x86_64" => pick_amd64_asset(&linux_assets, amd64_variant),
-        "aarch64" => pick_asset_by_keywords(&linux_assets, &["arm64", "aarch64"]),
-        "arm" => pick_asset_by_keywords(&linux_assets, &["armv7", "armv6", "arm"]),
+        "x86_64" => pick_amd64_asset(&matched, amd64_variant),
+        "aarch64" => pick_asset_by_keywords(&matched, &["arm64", "aarch64"]),
+        "arm" => pick_asset_by_keywords(&matched, &["armv7", "armv6", "arm"]),
         _ => bail!("暂不支持的架构: {arch}"),
     }
 }
@@ -302,6 +366,35 @@ fn pick_asset_by_keywords(assets: &[GitHubAsset], keywords: &[&str]) -> Result<G
     }
     let joined = keywords.join(", ");
     bail!("未找到匹配资产，关键词: {joined}")
+}
+
+fn asset_sha256(asset: &GitHubAsset) -> Result<String> {
+    let digest = asset
+        .digest
+        .as_deref()
+        .and_then(|value| value.strip_prefix("sha256:"))
+        .filter(|value| value.len() == 64 && value.chars().all(|c| c.is_ascii_hexdigit()))
+        .with_context(|| {
+            format!(
+                "GitHub 发布资产 {} 缺少可信 SHA256 digest，已拒绝安装",
+                asset.name
+            )
+        })?;
+    Ok(digest.to_string())
+}
+
+fn sha256_hex(path: &Path) -> Result<String> {
+    let mut file = File::open(path).with_context(|| format!("打开文件失败: {}", path.display()))?;
+    let mut hasher = Sha256::new();
+    let mut buf = [0u8; 8192];
+    loop {
+        let n = file.read(&mut buf).context("读取文件失败")?;
+        if n == 0 {
+            break;
+        }
+        hasher.update(&buf[..n]);
+    }
+    Ok(format!("{:x}", hasher.finalize()))
 }
 
 fn decompress_gzip_to_file(input_gz_path: &Path, output_path: &Path) -> Result<()> {
@@ -349,7 +442,7 @@ fn write_core_meta(path: &Path, version: &str, asset_name: &str, source_url: &st
     let content = format!(
         "version={version}\nasset={asset_name}\nsource_url={source_url}\ninstalled_at={installed_at}\n"
     );
-    fs::write(path, content).with_context(|| format!("写入元信息失败: {}", path.display()))
+    write_atomic_text(path, &content).with_context(|| format!("写入元信息失败: {}", path.display()))
 }
 
 fn load_core_meta(path: &Path) -> Result<CoreMeta> {
@@ -367,4 +460,58 @@ fn load_core_meta(path: &Path) -> Result<CoreMeta> {
     Ok(CoreMeta {
         version: version.context("元信息缺少 version 字段")?,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn asset(name: &str) -> GitHubAsset {
+        GitHubAsset {
+            name: name.to_string(),
+            browser_download_url: format!("https://example.com/{name}"),
+            digest: None,
+        }
+    }
+
+    #[test]
+    fn darwin_arm64_picks_darwin_not_linux() {
+        let assets = vec![
+            asset("mihomo-linux-arm64-v1.19.0.gz"),
+            asset("mihomo-linux-amd64-compatible-v1.19.0.gz"),
+            asset("mihomo-darwin-arm64-v1.19.0.gz"),
+            asset("mihomo-darwin-amd64-v1.19.0.gz"),
+        ];
+        let picked =
+            select_release_asset_for("darwin", "aarch64", &assets, Amd64Variant::Auto).unwrap();
+        assert!(picked.name.contains("darwin"), "{}", picked.name);
+        assert!(!picked.name.contains("linux"), "{}", picked.name);
+        assert!(picked.name.contains("arm64"), "{}", picked.name);
+    }
+
+    #[test]
+    fn darwin_amd64_picks_darwin_amd64() {
+        let assets = vec![
+            asset("mihomo-linux-amd64-v1.19.0.gz"),
+            asset("mihomo-darwin-amd64-v1.19.0.gz"),
+            asset("mihomo-darwin-arm64-v1.19.0.gz"),
+        ];
+        let picked =
+            select_release_asset_for("darwin", "x86_64", &assets, Amd64Variant::Auto).unwrap();
+        assert!(picked.name.contains("darwin"));
+        assert!(picked.name.contains("amd64"));
+        assert!(!picked.name.contains("linux"));
+    }
+
+    #[test]
+    fn linux_arm64_still_picks_linux() {
+        let assets = vec![
+            asset("mihomo-linux-arm64-v1.19.0.gz"),
+            asset("mihomo-darwin-arm64-v1.19.0.gz"),
+        ];
+        let picked =
+            select_release_asset_for("linux", "aarch64", &assets, Amd64Variant::Auto).unwrap();
+        assert!(picked.name.contains("linux"));
+        assert!(!picked.name.contains("darwin"));
+    }
 }

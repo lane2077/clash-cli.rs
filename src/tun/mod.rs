@@ -13,12 +13,15 @@ use serde_yaml::{Mapping, Value};
 
 use crate::cli::{TunApplyArgs, TunCommand, TunStatusArgs};
 use crate::constants::DEFAULT_REDIR_PORT;
+use crate::mixin;
 use crate::output::{is_json_mode, print_json};
 use crate::paths::app_paths;
-use crate::utils::{self, command_exists, ensure_linux_host, normalize_unit_name, now_unix};
+use crate::profile;
+use crate::utils::{self, command_exists, ensure_supported_host, normalize_unit_name, now_unix};
 
+pub use self::checks::{DoctorCheckView, docker_bridge_dataplane_note};
 use self::config::*;
-use self::detect::detect_exclude_uids;
+pub use self::config::{apply_tun_policy_overlay, apply_tun_policy_overlay_for};
 use self::privilege::{PrivilegeCheck, TunAction, ensure_tun_privileges_or_delegate};
 use self::rules::{
     cleanup_dataplane_rules, cleanup_dataplane_rules_all, cleanup_dataplane_rules_all_best_effort,
@@ -36,59 +39,36 @@ pub fn run(command: TunCommand) -> Result<()> {
 }
 
 fn cmd_on(args: TunApplyArgs) -> Result<()> {
-    ensure_linux_host()?;
+    ensure_supported_host()?;
     if ensure_tun_privileges_or_delegate(TunAction::On, &args)? == PrivilegeCheck::Delegated {
         return Ok(());
     }
     let json_mode = is_json_mode();
 
-    if !Path::new("/dev/net/tun").exists() {
+    if utils::is_linux() && !Path::new("/dev/net/tun").exists() {
         bail!("未找到 /dev/net/tun，请先修复系统环境");
     }
 
     let paths = app_paths()?;
-    let mut root = load_or_init_config(&paths.runtime_config_file)?;
+    let mut overlay = mixin::load_mixin_or_empty(&paths.profile_mixin_file)?;
+    apply_tun_policy_overlay(&mut overlay, true);
 
-    set_bool_field(&mut root, &["tun"], "enable", true);
-    set_default_bool_field(&mut root, &["tun"], "auto-route", true);
-    set_default_bool_field(&mut root, &["tun"], "auto-detect-interface", true);
-    set_default_bool_field(&mut root, &["tun"], "auto-redirect", true);
-    // strict-route 在部分发行版/路由环境下更容易触发 /1 路由写入失败，默认保守关闭。
-    set_default_bool_field(&mut root, &["tun"], "strict-route", false);
-    set_default_string_field(&mut root, &["tun"], "stack", "mixed");
-    set_default_bool_field(&mut root, &["dns"], "enable", true);
-    // Linux 桌面环境下优先稳定性：默认关闭 IPv6，避免常见的 auto-route 路由下发失败。
-    set_bool_field(&mut root, &[], "ipv6", false);
-    set_bool_field(&mut root, &["dns"], "ipv6", false);
-    set_default_string_field(&mut root, &["dns"], "enhanced-mode", "fake-ip");
-    // dns-hijack 确保系统 DNS 请求被 mihomo 接管，fake-ip 模式必需。
-    set_default_sequence_field(&mut root, &["tun"], "dns-hijack", &["any:53".to_string()]);
-    set_default_u16_field(&mut root, &[], "redir-port", DEFAULT_REDIR_PORT);
+    let auto_redirect = bool_field(key_value(&overlay, "tun"), "auto-redirect").unwrap_or(false);
+    let redir_port = u16_field(Some(&overlay), "redir-port").unwrap_or(DEFAULT_REDIR_PORT);
 
-    // mihomo 的 auto-redirect 自己能正确处理 Docker 流量，不需要接口排除
-    remove_tun_key(&mut root, "include-interface");
-    remove_tun_key(&mut root, "exclude-interface");
-    // 检测需要排除的 UID（cloudflared 等服务进程）
-    let excluded_uids = detect_exclude_uids();
-    if !excluded_uids.is_empty() {
-        let uid_values: Vec<String> = excluded_uids.iter().map(|u| u.to_string()).collect();
-        set_u32_sequence_field(&mut root, &["tun"], "exclude-uid", &excluded_uids);
-        if !json_mode {
-            println!("已检测到排除 UID: {}", uid_values.join(", "));
-        }
-    }
-
-    let auto_redirect = bool_field(key_value(&root, "tun"), "auto-redirect").unwrap_or(false);
-    let redir_port = u16_field(Some(&root), "redir-port").unwrap_or(DEFAULT_REDIR_PORT);
-
-    save_config(&paths.runtime_config_file, &root)?;
+    mixin::save_mixin(&paths.profile_mixin_file, &overlay)?;
+    profile::render_runtime_from_home(&paths)?;
 
     // mihomo 在 auto-redirect=true 时自行管理 nft 规则，
     // clash CLI 不再自建规则，避免双表冲突。
     // 无论 auto_redirect 与否，都清理可能存在的历史自建规则。
-    cleanup_dataplane_rules_all_best_effort();
+    if utils::is_linux() {
+        cleanup_dataplane_rules_all_best_effort();
+    }
     if !json_mode {
-        if auto_redirect {
+        if utils::is_macos() {
+            println!("macOS TUN 使用 mihomo auto-route / utun，不经过 nft auto-redirect。");
+        } else if auto_redirect {
             println!("已配置 auto-redirect=true，mihomo 将自行管理数据面规则");
         } else {
             println!("检测到 tun.auto-redirect=false，已跳过规则下发。");
@@ -132,7 +112,10 @@ fn cmd_on(args: TunApplyArgs) -> Result<()> {
         }));
     }
 
-    println!("已开启 tun 配置: {}", paths.runtime_config_file.display());
+    println!(
+        "已将 tun 策略写入 mixin 并渲染运行配置: {}",
+        paths.runtime_config_file.display()
+    );
     if args.no_restart {
         println!("已跳过服务重启（--no-restart）。");
     }
@@ -141,30 +124,20 @@ fn cmd_on(args: TunApplyArgs) -> Result<()> {
 }
 
 fn cmd_off(args: TunApplyArgs) -> Result<()> {
-    ensure_linux_host()?;
+    ensure_supported_host()?;
     if ensure_tun_privileges_or_delegate(TunAction::Off, &args)? == PrivilegeCheck::Delegated {
         return Ok(());
     }
     let json_mode = is_json_mode();
     let paths = app_paths()?;
-    let mut root = load_or_init_config(&paths.runtime_config_file)?;
+    let mut overlay = mixin::load_mixin_or_empty(&paths.profile_mixin_file)?;
+    apply_tun_policy_overlay(&mut overlay, false);
+    let redir_port = u16_field(Some(&overlay), "redir-port").unwrap_or(DEFAULT_REDIR_PORT);
+    mixin::save_mixin(&paths.profile_mixin_file, &overlay)?;
+    profile::render_runtime_from_home(&paths)?;
 
     let previous_state = read_tun_state(&paths.runtime_tun_state_file)?;
-    let redir_port = u16_field(Some(&root), "redir-port").unwrap_or(DEFAULT_REDIR_PORT);
-
-    set_bool_field(&mut root, &["tun"], "enable", false);
-    save_config(&paths.runtime_config_file, &root)?;
-
-    let cleanup_result = if let Some(state) = previous_state.as_ref() {
-        if state.rules_applied {
-            cleanup_dataplane_rules(state.backend)
-        } else {
-            Ok(())
-        }
-    } else {
-        cleanup_dataplane_rules_all()
-    };
-    cleanup_result.context("清理数据面规则失败")?;
+    cleanup_linux_dataplane_after_tun_off(previous_state.as_ref()).context("清理数据面规则失败")?;
 
     write_tun_state(
         &paths.runtime_tun_state_file,
@@ -207,7 +180,7 @@ fn cmd_off(args: TunApplyArgs) -> Result<()> {
 }
 
 fn cmd_status(args: TunStatusArgs) -> Result<()> {
-    ensure_linux_host()?;
+    ensure_supported_host()?;
     let paths = app_paths()?;
     let root = if paths.runtime_config_file.exists() {
         load_existing_config(&paths.runtime_config_file)?
@@ -256,15 +229,21 @@ fn cmd_status(args: TunStatusArgs) -> Result<()> {
         println!("dns.ipv6: {}", bool_or_unset(bool_field(dns, "ipv6")));
     }
 
-    let device_ok = Path::new("/dev/net/tun").exists();
+    let device_ok = tun_device_supported();
+    // macOS 的 utun 编号动态分配，仅凭“服务已加载”不能证明 TUN 接口属于 mihomo。
+    // 因此这里明确返回未知，而不是把未验证状态当成 true。
+    let interface_ready = if utils::is_macos() {
+        None
+    } else {
+        Some(tun_interface_ready(tun))
+    };
     let backend_installed = command_exists("nft") || command_exists("iptables");
     let active_backend = detect_active_rule_backend();
     let rules_active = active_backend != RuleBackend::None;
-    // auto-redirect 由 mihomo 管理，不再检查自建规则是否存在
-    let redirect_ready = true;
     let service_active = query_service_active(&args.name, args.user).unwrap_or(false);
     let last_state = read_tun_state(&paths.runtime_tun_state_file)?;
-    let actual_ok = tun_enable && device_ok && redirect_ready && service_active;
+    // 数据面由内核 auto-route / auto-redirect 管理，CLI 自建表缺失不视为失败。
+    let actual_ok = interface_ready.map(|ready| actual_tun_ok(tun_enable, ready, service_active));
 
     if is_json_mode() {
         let last_state_json = match last_state {
@@ -297,6 +276,9 @@ fn cmd_status(args: TunStatusArgs) -> Result<()> {
             },
             "runtime": {
                 "device_ok": device_ok,
+                "interface_ready": interface_ready,
+                "interface_verified": interface_ready.is_some(),
+                "interface": expected_tun_interface(tun),
                 "backend_installed": backend_installed,
                 "active_backend": active_backend.as_str(),
                 "rules_active": rules_active,
@@ -309,9 +291,14 @@ fn cmd_status(args: TunStatusArgs) -> Result<()> {
         }));
     }
 
+    let interface_text = interface_ready
+        .map(yes_no)
+        .unwrap_or("未确认（macOS 动态 utun）");
     println!(
-        "系统能力: /dev/net/tun={}, backend={}",
+        "系统能力: /dev/net/tun={}, TUN 接口={} ({}), backend={}",
         yes_no(device_ok),
+        interface_text,
+        expected_tun_interface(tun),
         yes_no(backend_installed)
     );
     println!(
@@ -346,11 +333,65 @@ fn cmd_status(args: TunStatusArgs) -> Result<()> {
         None => println!("最近操作: 无"),
     }
 
-    println!("实际状态: {}", if actual_ok { "生效" } else { "未生效" });
-    if !actual_ok {
-        println!("建议执行 `clash tun doctor` 查看详细问题。");
+    match actual_ok {
+        Some(true) => println!("实际状态: 生效"),
+        Some(false) => {
+            println!("实际状态: 未生效");
+            println!("建议执行 `clash tun doctor` 查看详细问题。");
+        }
+        None => println!("实际状态: 未确认（macOS 无法仅凭 launchd 状态确认动态 utun 接管）"),
     }
     Ok(())
+}
+
+/// 实际是否接管：配置开启 + 运行时 TUN 接口存在 + 服务在跑。
+/// 不要求 CLI 自建 nft/iptables 表。
+pub fn actual_tun_ok(tun_enable: bool, interface_ready: bool, service_active: bool) -> bool {
+    tun_enable && interface_ready && service_active
+}
+
+fn tun_device_supported() -> bool {
+    if utils::is_macos() {
+        true
+    } else {
+        Path::new("/dev/net/tun").exists()
+    }
+}
+
+fn expected_tun_interface(tun: Option<&Value>) -> String {
+    string_field(tun, "device").unwrap_or_else(|| "Meta".to_string())
+}
+
+fn tun_interface_ready(tun: Option<&Value>) -> bool {
+    if utils::is_macos() {
+        // macOS 的 utun 编号由系统动态分配，服务状态仍由 launchd 检查。
+        return true;
+    }
+    if !tun_device_supported() {
+        return false;
+    }
+    let interface = expected_tun_interface(tun);
+    if interface.is_empty() || interface.contains('/') {
+        return false;
+    }
+    Path::new("/sys/class/net")
+        .join(interface)
+        .join("tun_flags")
+        .exists()
+}
+
+/// Linux nft/iptables 历史规则清理。macOS 走 utun/auto-route，没有这些表。
+fn cleanup_linux_dataplane_after_tun_off(previous: Option<&TunState>) -> Result<()> {
+    if !utils::is_linux() {
+        return Ok(());
+    }
+    if let Some(state) = previous {
+        if state.rules_applied {
+            return cleanup_dataplane_rules(state.backend);
+        }
+        return Ok(());
+    }
+    cleanup_dataplane_rules_all()
 }
 
 // --- Shared helpers used across submodules ---
@@ -375,17 +416,10 @@ pub(super) fn run_cmd(program: &str, args: &[&str]) -> Result<()> {
 }
 
 fn restart_service_best_effort(name: &str, user: bool) -> bool {
-    let mut args = vec![];
-    if user {
-        args.push("--user");
-    }
-    args.push("restart");
-    let unit = normalize_unit_name(name);
-    args.push(unit.as_str());
-    match run_cmd("systemctl", &args) {
+    match crate::service::restart_managed_service(name, user) {
         Ok(()) => {
             if !is_json_mode() {
-                println!("已重启服务: {}", normalize_unit_name(name));
+                println!("已重启服务: {}", name);
             }
             true
         }
@@ -404,19 +438,7 @@ fn restart_service_best_effort(name: &str, user: bool) -> bool {
 }
 
 fn query_service_active(name: &str, user: bool) -> Result<bool> {
-    if !utils::command_exists("systemctl") {
-        bail!("未检测到 systemctl");
-    }
-    let mut cmd = Command::new("systemctl");
-    if user {
-        cmd.arg("--user");
-    }
-    let unit = normalize_unit_name(name);
-    let status = cmd.arg("is-active").arg("--quiet").arg(unit).status();
-    match status {
-        Ok(v) => Ok(v.success()),
-        Err(err) => Err(err).context("执行 systemctl is-active 失败"),
-    }
+    crate::service::is_managed_service_active(name, user)
 }
 
 fn bool_or_unset(v: Option<bool>) -> &'static str {
@@ -429,4 +451,35 @@ fn bool_or_unset(v: Option<bool>) -> &'static str {
 
 fn yes_no(v: bool) -> &'static str {
     if v { "是" } else { "否" }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn actual_ok_does_not_require_cli_owned_tables() {
+        assert!(actual_tun_ok(true, true, true));
+        assert!(!actual_tun_ok(false, true, true));
+        assert!(!actual_tun_ok(true, false, true));
+        assert!(!actual_tun_ok(true, true, false));
+    }
+
+    #[test]
+    fn tun_interface_name_defaults_to_meta_and_honors_config() {
+        let root = Value::Mapping(Mapping::new());
+        assert_eq!(expected_tun_interface(Some(&root)), "Meta");
+
+        let mut root = Value::Mapping(Mapping::new());
+        config::set_default_string_field(&mut root, &[], "device", "mihomo-test");
+        assert_eq!(expected_tun_interface(Some(&root)), "mihomo-test");
+    }
+
+    #[test]
+    fn dataplane_cleanup_is_noop_off_linux() {
+        if cfg!(target_os = "linux") {
+            return;
+        }
+        cleanup_linux_dataplane_after_tun_off(None).unwrap();
+    }
 }

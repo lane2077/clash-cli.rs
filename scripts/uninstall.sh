@@ -15,7 +15,7 @@ usage() {
   scripts/uninstall.sh [选项]
 
 选项:
-  --service-name NAME      systemd 服务名，默认 clash-mihomo
+  --service-name NAME      服务名（systemd/launchd），默认 clash-mihomo
   --home PATH              CLASH_CLI_HOME，默认 /etc/clash-cli
   --keep-home              保留 CLASH_CLI_HOME 目录
   --keep-core              保留 /usr/local/bin/mihomo
@@ -58,10 +58,14 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
-if [[ "$(uname -s)" != "Linux" ]]; then
-  echo "仅支持 Linux。" >&2
-  exit 1
-fi
+UNAME_S="$(uname -s)"
+case "${UNAME_S}" in
+  Linux|Darwin) ;;
+  *)
+    echo "仅支持 Linux 与 macOS，当前: ${UNAME_S}" >&2
+    exit 1
+    ;;
+esac
 
 if [[ "$(id -u)" -ne 0 ]]; then
   if ! command -v sudo >/dev/null 2>&1; then
@@ -74,11 +78,10 @@ else
 fi
 
 run_best_effort() {
-  set +e
-  "$@"
-  local code=$?
-  set -e
-  return ${code}
+  if ! "$@"; then
+    echo "警告: 可选清理步骤失败，继续卸载: $*" >&2
+  fi
+  return 0
 }
 
 if [[ -x "${CLASH_BIN_PATH}" ]]; then
@@ -89,12 +92,23 @@ else
   echo "未检测到 ${CLASH_BIN_PATH}，跳过 CLI 卸载流程。"
 fi
 
-echo "清理遗留数据面规则..."
-run_best_effort ${SUDO} nft delete table inet clash_cli_tun >/dev/null
-run_best_effort ${SUDO} iptables -t nat -F CLASH_CLI_TUN >/dev/null
-run_best_effort ${SUDO} iptables -t nat -X CLASH_CLI_TUN >/dev/null
-run_best_effort ${SUDO} ip6tables -t nat -F CLASH_CLI_TUN >/dev/null
-run_best_effort ${SUDO} ip6tables -t nat -X CLASH_CLI_TUN >/dev/null
+if [[ "${UNAME_S}" == "Linux" ]]; then
+  echo "清理遗留数据面规则..."
+  run_best_effort ${SUDO} nft delete table inet clash_cli_tun >/dev/null
+  run_best_effort ${SUDO} iptables -t nat -F CLASH_CLI_TUN >/dev/null
+  run_best_effort ${SUDO} iptables -t nat -X CLASH_CLI_TUN >/dev/null
+  run_best_effort ${SUDO} ip6tables -t nat -F CLASH_CLI_TUN >/dev/null
+  run_best_effort ${SUDO} ip6tables -t nat -X CLASH_CLI_TUN >/dev/null
+fi
+LABEL="com.clash-cli.${SERVICE_NAME%.service}"
+if [[ "${UNAME_S}" == "Darwin" ]]; then
+  echo "卸载 launchd: ${LABEL}"
+  UID_NUM="$(id -u)"
+  run_best_effort launchctl bootout "gui/${UID_NUM}/${LABEL}" >/dev/null
+  run_best_effort ${SUDO} launchctl bootout "system/${LABEL}" >/dev/null
+  run_best_effort rm -f "${HOME}/Library/LaunchAgents/${LABEL}.plist"
+  run_best_effort ${SUDO} rm -f "/Library/LaunchDaemons/${LABEL}.plist"
+fi
 
 if [[ "${KEEP_HOME}" -eq 0 ]]; then
   echo "清理目录: ${CLASH_HOME}"

@@ -10,7 +10,7 @@ use serde_yaml::Value;
 use crate::auto_sudo;
 use crate::cli::{
     ProfileAddArgs, ProfileCommand, ProfileFetchArgs, ProfileRemoveArgs, ProfileRenderArgs,
-    ProfileUseArgs, ProfileValidateArgs,
+    ProfileUpdateArgs, ProfileUseArgs, ProfileValidateArgs,
 };
 use crate::constants;
 use crate::output::{is_json_mode, print_json};
@@ -47,6 +47,7 @@ pub fn run(command: ProfileCommand) -> Result<()> {
         ProfileCommand::List => cmd_list(),
         ProfileCommand::Use(args) => cmd_use(args),
         ProfileCommand::Fetch(args) => cmd_fetch(args),
+        ProfileCommand::Update(args) => cmd_update(args),
         ProfileCommand::Remove(args) => cmd_remove(args),
         ProfileCommand::Render(args) => cmd_render(args),
         ProfileCommand::Validate(args) => cmd_validate(args),
@@ -128,6 +129,7 @@ fn cmd_list() -> Result<()> {
     if index.profiles.is_empty() {
         print_profile_home_hint(&paths);
         println!("暂无 profile。可执行 `clash profile add --name xxx --url ...`");
+        println!("已有订阅后更新并生效: clash profile update");
         return Ok(());
     }
 
@@ -156,37 +158,28 @@ fn cmd_use(args: ProfileUseArgs) -> Result<()> {
     let paths = app_paths()?;
     let apply = args.apply || args.fetch;
 
-    if apply && !args.no_restart {
-        ensure_service_runtime_home_matches_current(
-            &args.service_name,
-            &paths.runtime_config_file,
-        )?;
-    }
-
     let mut index = load_index(&paths.profile_index_file)?;
 
     if !index.profiles.iter().any(|p| p.name == args.name) {
         bail!("profile 不存在: {}", args.name);
     }
-    index.active = Some(args.name.clone());
-    save_index(&paths.profile_index_file, &index)?;
 
-    if args.fetch {
-        cmd_fetch(ProfileFetchArgs {
-            name: args.name.clone(),
-            force: true,
-        })?;
-    }
     if apply {
-        cmd_render(ProfileRenderArgs {
-            name: Some(args.name.clone()),
-            output: None,
-            no_mixin: false,
-            follow_subscription_port: false,
-        })?;
-        if !args.no_restart {
-            restart_system_service(&args.service_name)?;
-        }
+        // 先完成 fetch/render，成功后再提交 active，避免失败切换留下半状态。
+        apply_subscription(
+            &paths,
+            ApplySpec {
+                name: Some(args.name.clone()),
+                fetch: args.fetch,
+                render: true,
+                restart: !args.no_restart,
+                service_name: args.service_name.clone(),
+            },
+        )?;
+        index = load_index(&paths.profile_index_file)?;
+    } else {
+        index.active = Some(args.name.clone());
+        save_index(&paths.profile_index_file, &index)?;
     }
 
     if is_json_mode() {
@@ -214,58 +207,118 @@ fn cmd_use(args: ProfileUseArgs) -> Result<()> {
         }
     } else {
         println!(
-            "提示: 仅切换了 active profile；如需立即生效请执行 `clash profile use --name {} --apply`",
+            "提示: 仅切换了 active profile；更新并生效: clash profile update --name {}",
             args.name
         );
     }
     Ok(())
 }
 
-fn cmd_fetch(args: ProfileFetchArgs) -> Result<()> {
+fn cmd_update(args: ProfileUpdateArgs) -> Result<()> {
     let paths = app_paths()?;
-    let mut index = load_index(&paths.profile_index_file)?;
-    let profile_snapshot = {
-        let profile = index
-            .profiles
-            .iter_mut()
-            .find(|p| p.name == args.name)
-            .context("profile 不存在")?;
-
-        let profile_path = paths.profile_dir.join(&profile.file);
-        if !args.force
-            && profile.updated_at.is_some()
-            && profile_path.exists()
-            && utils::now_unix().saturating_sub(profile.updated_at.unwrap_or(0)) < 60
-        {
-            if is_json_mode() {
-                return print_json(&serde_json::json!({
-                    "ok": true,
-                    "action": "profile.fetch",
-                    "name": args.name,
-                    "skipped": true,
-                    "reason": "recently updated",
-                }));
-            }
-            println!("最近 60 秒内已更新，跳过拉取。可加 --force 强制更新。");
-            return Ok(());
-        }
-
-        fetch_profile_entry(profile, &paths.profile_dir, args.force)?;
-        profile.clone()
-    };
-
-    save_index(&paths.profile_index_file, &index)?;
+    let applied = apply_subscription(
+        &paths,
+        ApplySpec {
+            name: args.name.clone(),
+            fetch: true,
+            render: true,
+            restart: !args.no_restart,
+            service_name: args.service_name.clone(),
+        },
+    )?;
+    let name = applied.name;
+    let restarted = applied.restarted;
 
     if is_json_mode() {
         return print_json(&serde_json::json!({
             "ok": true,
-            "action": "profile.fetch",
-            "profile": profile_snapshot,
+            "action": "profile.update",
+            "profile": name,
+            "fetched": true,
+            "applied": true,
+            "restarted": restarted,
+            "service": utils::normalize_unit_name(&args.service_name),
         }));
     }
 
-    println!("profile 拉取成功: {}", args.name);
+    println!("已更新并渲染: {}", name);
+    if restarted {
+        println!(
+            "已重启服务: {}",
+            utils::normalize_unit_name(&args.service_name)
+        );
+    } else if args.no_restart {
+        println!("已跳过服务重启（--no-restart）。");
+    }
     Ok(())
+}
+
+struct FetchOutcome {
+    skipped: bool,
+    profile: ProfileEntry,
+}
+
+fn cmd_fetch(args: ProfileFetchArgs) -> Result<()> {
+    let outcome = fetch_profile_named(&args.name, args.force)?;
+    if is_json_mode() {
+        if outcome.skipped {
+            return print_json(&serde_json::json!({
+                "ok": true,
+                "action": "profile.fetch",
+                "name": args.name,
+                "skipped": true,
+                "reason": "recently updated",
+            }));
+        }
+        return print_json(&serde_json::json!({
+            "ok": true,
+            "action": "profile.fetch",
+            "profile": outcome.profile,
+        }));
+    }
+
+    if outcome.skipped {
+        println!("最近 60 秒内已更新，跳过拉取。可加 --force 强制更新。");
+    } else {
+        println!("profile 拉取成功: {}", args.name);
+    }
+    Ok(())
+}
+
+fn fetch_profile_named(name: &str, force: bool) -> Result<FetchOutcome> {
+    fetch_profile_in(&app_paths()?, name, force)
+}
+
+fn fetch_profile_in(paths: &AppPaths, name: &str, force: bool) -> Result<FetchOutcome> {
+    let mut index = load_index(&paths.profile_index_file)?;
+    let outcome = {
+        let profile = index
+            .profiles
+            .iter_mut()
+            .find(|p| p.name == name)
+            .context("profile 不存在")?;
+
+        let profile_path = paths.profile_dir.join(&profile.file);
+        if !force
+            && profile.updated_at.is_some()
+            && profile_path.exists()
+            && utils::now_unix().saturating_sub(profile.updated_at.unwrap_or(0)) < 60
+        {
+            return Ok(FetchOutcome {
+                skipped: true,
+                profile: profile.clone(),
+            });
+        }
+
+        fetch_profile_entry(profile, &paths.profile_dir, force)?;
+        FetchOutcome {
+            skipped: false,
+            profile: profile.clone(),
+        }
+    };
+
+    save_index(&paths.profile_index_file, &index)?;
+    Ok(outcome)
 }
 
 fn cmd_remove(args: ProfileRemoveArgs) -> Result<()> {
@@ -284,7 +337,12 @@ fn cmd_remove(args: ProfileRemoveArgs) -> Result<()> {
     save_index(&paths.profile_index_file, &index)?;
 
     let profile_path = paths.profile_dir.join(removed.file);
-    if profile_path.exists() {
+    let reserved_mixin_file = profile_path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .map(|name| name.eq_ignore_ascii_case("mixin.yaml"))
+        .unwrap_or(false);
+    if profile_path.exists() && !reserved_mixin_file {
         fs::remove_file(&profile_path)
             .with_context(|| format!("删除 profile 文件失败: {}", profile_path.display()))?;
     }
@@ -302,8 +360,43 @@ fn cmd_remove(args: ProfileRemoveArgs) -> Result<()> {
     Ok(())
 }
 
+struct RenderOutcome {
+    profile: String,
+    output: PathBuf,
+}
+
 fn cmd_render(args: ProfileRenderArgs) -> Result<()> {
-    let paths = app_paths()?;
+    let outcome = render_profile_to_runtime(&args)?;
+    if is_json_mode() {
+        return print_json(&serde_json::json!({
+            "ok": true,
+            "action": "profile.render",
+            "profile": outcome.profile,
+            "output": outcome.output.display().to_string(),
+            "follow_subscription_port": args.follow_subscription_port,
+        }));
+    }
+
+    println!(
+        "渲染完成: profile={} -> {}",
+        outcome.profile,
+        outcome.output.display()
+    );
+    if args.follow_subscription_port {
+        println!("已保留订阅中的监听端口设置。");
+    } else {
+        println!(
+            "已应用本地默认值（mixed=7890, socks=7891, controller=127.0.0.1:9090, ui=metacubexd）。"
+        );
+    }
+    Ok(())
+}
+
+fn render_profile_to_runtime(args: &ProfileRenderArgs) -> Result<RenderOutcome> {
+    render_profile_in(&app_paths()?, args)
+}
+
+fn render_profile_in(paths: &AppPaths, args: &ProfileRenderArgs) -> Result<RenderOutcome> {
     let index = load_index(&paths.profile_index_file)?;
     let selected = select_profile(&index, args.name.as_deref())?;
     let source_path = paths.profile_dir.join(&selected.file);
@@ -315,47 +408,24 @@ fn cmd_render(args: ProfileRenderArgs) -> Result<()> {
         );
     }
 
-    let mut root = load_yaml(&source_path)?;
-    if !args.follow_subscription_port {
-        apply_local_listener_defaults(&mut root);
-    }
-    if !args.no_mixin && paths.profile_mixin_file.exists() {
-        let mixin = load_yaml(&paths.profile_mixin_file)?;
-        deep_merge(&mut root, &mixin);
-    }
-
-    let output = args.output.unwrap_or(paths.runtime_config_file);
-    if let Some(parent) = output.parent() {
-        fs::create_dir_all(parent)
-            .with_context(|| format!("创建目录失败: {}", parent.display()))?;
-    }
-    let rendered = serde_yaml::to_string(&root).context("序列化渲染结果失败")?;
-    fs::write(&output, rendered)
-        .with_context(|| format!("写入渲染配置失败: {}", output.display()))?;
-
-    if is_json_mode() {
-        return print_json(&serde_json::json!({
-            "ok": true,
-            "action": "profile.render",
-            "profile": selected.name,
-            "output": output.display().to_string(),
-            "follow_subscription_port": args.follow_subscription_port,
-        }));
-    }
-
-    println!(
-        "渲染完成: profile={} -> {}",
-        selected.name,
-        output.display()
-    );
-    if args.follow_subscription_port {
-        println!("已保留订阅中的监听端口设置。");
+    let root = load_yaml(&source_path)?;
+    validate_subscription_root(&root)?;
+    let mixin = if !args.no_mixin && paths.profile_mixin_file.exists() {
+        Some(load_yaml(&paths.profile_mixin_file)?)
     } else {
-        println!(
-            "已应用本地默认值（mixed=7890, socks=7891, controller=127.0.0.1:9090, ui=metacubexd）。"
-        );
-    }
-    Ok(())
+        None
+    };
+    let root = merge_subscription_overlay(root, mixin.as_ref(), args.follow_subscription_port);
+
+    let output = args
+        .output
+        .clone()
+        .unwrap_or_else(|| paths.runtime_config_file.clone());
+    write_yaml_file(&output, &root)?;
+    Ok(RenderOutcome {
+        profile: selected.name.clone(),
+        output,
+    })
 }
 
 fn cmd_validate(args: ProfileValidateArgs) -> Result<()> {
@@ -385,7 +455,7 @@ fn cmd_validate(args: ProfileValidateArgs) -> Result<()> {
 
     if is_json_mode() {
         return print_json(&serde_json::json!({
-            "ok": warnings.is_empty(),
+            "ok": true,
             "action": "profile.validate",
             "profile": selected.name,
             "warnings": warnings,
@@ -407,6 +477,9 @@ fn validate_profile_name(name: &str) -> Result<()> {
     if name.trim().is_empty() {
         bail!("profile 名称不能为空");
     }
+    if name.eq_ignore_ascii_case("mixin") {
+        bail!("profile 名称 `mixin` 为保留名称，请换一个名称");
+    }
     for c in name.chars() {
         if !(c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.') {
             bail!("profile 名称仅支持字母/数字/.-_");
@@ -425,36 +498,69 @@ pub(crate) fn load_index(path: &Path) -> Result<ProfileIndex> {
 }
 
 pub(crate) fn save_index(path: &Path, index: &ProfileIndex) -> Result<()> {
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)
-            .with_context(|| format!("创建目录失败: {}", parent.display()))?;
-    }
     let content = serde_json::to_string_pretty(index).context("序列化 profile 索引失败")?;
-    fs::write(path, content).with_context(|| format!("写入 profile 索引失败: {}", path.display()))
+    utils::write_atomic_text(path, &content)
+        .with_context(|| format!("写入 profile 索引失败: {}", path.display()))
+}
+
+fn local_subscription_path(url: &str) -> Option<PathBuf> {
+    if let Some(rest) = url.strip_prefix("file://") {
+        return Some(PathBuf::from(rest));
+    }
+    let path = Path::new(url);
+    if path.is_file() {
+        Some(path.to_path_buf())
+    } else {
+        None
+    }
 }
 
 fn fetch_profile_entry(entry: &mut ProfileEntry, profile_dir: &Path, _force: bool) -> Result<()> {
+    if entry.file.eq_ignore_ascii_case("mixin.yaml") {
+        bail!("检测到旧版保留名称 profile `mixin`；为避免覆盖本地 mixin，请先改名后再拉取");
+    }
     fs::create_dir_all(profile_dir)
         .with_context(|| format!("创建目录失败: {}", profile_dir.display()))?;
-    let client = Client::builder()
-        .timeout(std::time::Duration::from_secs(30))
-        .connect_timeout(std::time::Duration::from_secs(10))
-        .build()
-        .context("创建 HTTP 客户端失败")?;
 
-    let response = client
-        .get(entry.url.clone())
-        .send()
-        .with_context(|| format!("请求订阅失败: {}", entry.url))?
-        .error_for_status()
-        .with_context(|| format!("订阅响应失败: {}", entry.url))?;
+    let body = if let Some(local) = local_subscription_path(&entry.url) {
+        fs::read_to_string(&local)
+            .with_context(|| format!("读取本地订阅失败: {}", local.display()))?
+    } else {
+        let client = Client::builder()
+            .timeout(std::time::Duration::from_secs(30))
+            .connect_timeout(std::time::Duration::from_secs(10))
+            .build()
+            .context("创建 HTTP 客户端失败")?;
 
-    let body = response.text().context("读取订阅响应失败")?;
-    let _: Value = serde_yaml::from_str(&body).context("订阅内容不是有效 YAML")?;
+        let response = client
+            .get(entry.url.clone())
+            .send()
+            .with_context(|| format!("请求订阅失败: {}", entry.url))?
+            .error_for_status()
+            .with_context(|| format!("订阅响应失败: {}", entry.url))?;
+
+        response.text().context("读取订阅响应失败")?
+    };
+    let root: Value = serde_yaml::from_str(&body).context("订阅内容不是有效 YAML")?;
+    validate_subscription_root(&root)?;
 
     let path = profile_dir.join(&entry.file);
-    fs::write(&path, body).with_context(|| format!("写入 profile 文件失败: {}", path.display()))?;
+    utils::write_atomic_text(&path, &body)
+        .with_context(|| format!("写入 profile 文件失败: {}", path.display()))?;
     entry.updated_at = Some(utils::now_unix());
+    Ok(())
+}
+
+fn validate_subscription_root(root: &Value) -> Result<()> {
+    let mapping = root
+        .as_mapping()
+        .context("订阅顶层必须是 YAML 对象，拒绝覆盖现有配置")?;
+    let has_proxy_source = ["proxies", "proxy-providers"]
+        .iter()
+        .any(|key| mapping.contains_key(Value::String((*key).to_string())));
+    if !has_proxy_source {
+        bail!("订阅缺少 proxies/proxy-providers，拒绝覆盖现有配置");
+    }
     Ok(())
 }
 
@@ -478,6 +584,137 @@ fn load_yaml(path: &Path) -> Result<Value> {
     let content =
         fs::read_to_string(path).with_context(|| format!("读取 YAML 失败: {}", path.display()))?;
     serde_yaml::from_str(&content).with_context(|| format!("解析 YAML 失败: {}", path.display()))
+}
+
+fn load_runtime_or_empty(path: &Path) -> Result<Value> {
+    if path.exists() {
+        load_yaml(path)
+    } else {
+        Ok(Value::Mapping(serde_yaml::Mapping::new()))
+    }
+}
+
+fn write_yaml_file(path: &Path, root: &Value) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)
+            .with_context(|| format!("创建目录失败: {}", parent.display()))?;
+    }
+    let rendered = serde_yaml::to_string(root).context("序列化渲染结果失败")?;
+    utils::write_atomic_text(path, &rendered)
+        .with_context(|| format!("写入渲染配置失败: {}", path.display()))
+}
+
+/// 订阅生效：拉取、合成 runtime、重启服务。
+/// `sub use --apply` 与 `sub update` 穿过同一 seam，不在命令里各拼一遍流水线。
+#[derive(Debug, Clone)]
+pub struct ApplySpec {
+    pub name: Option<String>,
+    pub fetch: bool,
+    pub render: bool,
+    pub restart: bool,
+    pub service_name: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct ApplyResult {
+    pub name: String,
+    pub fetched: bool,
+    pub applied: bool,
+    pub restarted: bool,
+}
+
+pub fn apply_subscription(paths: &AppPaths, spec: ApplySpec) -> Result<ApplyResult> {
+    if spec.restart {
+        ensure_service_runtime_home_matches_current(
+            &spec.service_name,
+            &paths.runtime_config_file,
+        )?;
+    }
+
+    let index = load_index(&paths.profile_index_file)?;
+    let selected = select_profile(&index, spec.name.as_deref())?;
+    let name = selected.name.clone();
+
+    let mut fetched = false;
+    if spec.fetch {
+        let outcome = fetch_profile_in(paths, &name, true)?;
+        fetched = !outcome.skipped;
+    }
+
+    let mut applied = false;
+    if spec.render {
+        render_profile_in(
+            paths,
+            &ProfileRenderArgs {
+                name: Some(name.clone()),
+                output: None,
+                no_mixin: false,
+                follow_subscription_port: false,
+            },
+        )?;
+        applied = true;
+    }
+
+    if spec.render {
+        // “已经应用的 profile”必须与 runtime 来源一致。指定名称的 update 也会成为 active；
+        // 仅想刷新但不应用时使用 `sub fetch`。
+        let mut committed_index = load_index(&paths.profile_index_file)?;
+        committed_index.active = Some(name.clone());
+        save_index(&paths.profile_index_file, &committed_index)?;
+    }
+
+    let mut restarted = false;
+    if spec.restart {
+        restart_system_service(&spec.service_name)?;
+        restarted = true;
+    }
+
+    Ok(ApplyResult {
+        name,
+        fetched,
+        applied,
+        restarted,
+    })
+}
+
+/// 订阅 YAML + mixin overlay → 运行配置。`follow_subscription_port` 为 true 时不覆盖监听端口。
+pub fn merge_subscription_overlay(
+    mut root: Value,
+    mixin: Option<&Value>,
+    follow_subscription_port: bool,
+) -> Value {
+    if !follow_subscription_port {
+        apply_local_listener_defaults(&mut root);
+    }
+    if let Some(mixin) = mixin {
+        deep_merge(&mut root, mixin);
+    }
+    root
+}
+
+/// 将当前 active profile（若有）与 mixin 合成为 runtime/config.yaml。
+pub fn render_runtime_from_home(paths: &AppPaths) -> Result<()> {
+    let mixin = if paths.profile_mixin_file.exists() {
+        Some(load_yaml(&paths.profile_mixin_file)?)
+    } else {
+        None
+    };
+    let index = load_index(&paths.profile_index_file)?;
+    let (base, apply_listener_defaults) = match select_profile(&index, None) {
+        Ok(selected) => {
+            let source_path = paths.profile_dir.join(&selected.file);
+            if source_path.exists() {
+                let base = load_yaml(&source_path)?;
+                validate_subscription_root(&base)?;
+                (base, true)
+            } else {
+                (load_runtime_or_empty(&paths.runtime_config_file)?, false)
+            }
+        }
+        Err(_) => (load_runtime_or_empty(&paths.runtime_config_file)?, false),
+    };
+    let rendered = merge_subscription_overlay(base, mixin.as_ref(), !apply_listener_defaults);
+    write_yaml_file(&paths.runtime_config_file, &rendered)
 }
 
 fn deep_merge(base: &mut Value, patch: &Value) {
@@ -545,24 +782,8 @@ fn key_exists(root: &Value, key: &str) -> bool {
 }
 
 fn restart_system_service(name: &str) -> Result<()> {
-    let unit = utils::normalize_unit_name(name);
-    let output = Command::new("systemctl")
-        .arg("restart")
-        .arg(&unit)
-        .output()
-        .with_context(|| format!("执行 systemctl restart 失败: {unit}"))?;
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        bail!(
-            "已渲染配置，但重启 {} 失败: {} (stdout={}, stderr={})",
-            unit,
-            output.status,
-            stdout.trim(),
-            stderr.trim()
-        );
-    }
-    Ok(())
+    crate::service::restart_managed_service(name, false)
+        .with_context(|| format!("已渲染配置，但重启 {name} 失败"))
 }
 
 fn ensure_service_runtime_home_matches_current(
@@ -610,14 +831,40 @@ fn ensure_service_runtime_home_matches_current(
 }
 
 fn detect_service_runtime_config_path(unit: &str) -> Result<Option<PathBuf>> {
-    let output = Command::new("systemctl")
+    if crate::utils::is_macos() {
+        return Ok(detect_launchd_runtime_config_path(unit));
+    }
+    detect_systemd_runtime_config_path(unit)
+}
+
+fn detect_launchd_runtime_config_path(unit: &str) -> Option<PathBuf> {
+    let label = crate::service::launchd_label(unit);
+    for path in crate::service::launchd_plist_search_paths(&label) {
+        let Ok(content) = fs::read_to_string(&path) else {
+            continue;
+        };
+        if let Some(cfg) = crate::service::launchd_plist_config_path(&content) {
+            return Some(cfg);
+        }
+    }
+    None
+}
+
+fn detect_systemd_runtime_config_path(unit: &str) -> Result<Option<PathBuf>> {
+    if !utils::command_exists("systemctl") {
+        return Ok(None);
+    }
+    let output = match Command::new("systemctl")
         .arg("show")
         .arg("-p")
         .arg("ExecStart")
         .arg("--value")
         .arg(unit)
         .output()
-        .with_context(|| format!("读取 service ExecStart 失败: {unit}"))?;
+    {
+        Ok(output) => output,
+        Err(_) => return Ok(None),
+    };
 
     if !output.status.success() {
         return Ok(None);
@@ -712,6 +959,7 @@ fn profile_command_requires_write(command: &ProfileCommand) -> bool {
             | ProfileCommand::Fetch(_)
             | ProfileCommand::Remove(_)
             | ProfileCommand::Render(_)
+            | ProfileCommand::Update(_)
     )
 }
 
@@ -768,6 +1016,18 @@ fn profile_command_to_cli_args(command: &ProfileCommand) -> Result<Vec<String>> 
             args.push(v.name.clone());
             if v.force {
                 args.push("--force".to_string());
+            }
+        }
+        ProfileCommand::Update(v) => {
+            args.push("update".to_string());
+            if let Some(name) = &v.name {
+                args.push("--name".to_string());
+                args.push(name.clone());
+            }
+            args.push("--service-name".to_string());
+            args.push(v.service_name.clone());
+            if v.no_restart {
+                args.push("--no-restart".to_string());
             }
         }
         ProfileCommand::Remove(v) => {
@@ -830,6 +1090,15 @@ mod tests {
     }
 
     #[test]
+    fn local_subscription_path_accepts_file_url_and_plain_path() {
+        assert_eq!(
+            local_subscription_path("file:///tmp/sub.yaml").as_deref(),
+            Some(Path::new("/tmp/sub.yaml"))
+        );
+        assert_eq!(local_subscription_path("https://example.com/a.yaml"), None);
+    }
+
+    #[test]
     fn validate_profile_name_should_accept_valid_name() {
         assert!(validate_profile_name("default").is_ok());
         assert!(validate_profile_name("my-profile_1.2").is_ok());
@@ -842,6 +1111,18 @@ mod tests {
         assert!(validate_profile_name("abc def").is_err());
         assert!(validate_profile_name("ab/def").is_err());
         assert!(validate_profile_name("中文").is_err());
+        assert!(validate_profile_name("mixin").is_err());
+        assert!(validate_profile_name("MIXIN").is_err());
+    }
+
+    #[test]
+    fn subscription_validation_rejects_scalar_and_error_mapping() {
+        let scalar = parse_yaml("upstream temporarily unavailable\n");
+        assert!(validate_subscription_root(&scalar).is_err());
+        let error_mapping = parse_yaml("message: temporarily unavailable\n");
+        assert!(validate_subscription_root(&error_mapping).is_err());
+        let valid = parse_yaml("proxies: []\nrules: []\n");
+        assert!(validate_subscription_root(&valid).is_ok());
     }
 
     #[test]
@@ -1015,5 +1296,82 @@ external-controller: 0.0.0.0:9091
         let selected_by_name =
             select_profile(&index, Some("other")).expect("按名称选择 profile 失败");
         assert_eq!(selected_by_name.name, "other");
+    }
+
+    fn yaml_bool(root: &Value, path: &[&str]) -> Option<bool> {
+        let mut current = root;
+        for key in path {
+            current = current
+                .as_mapping()?
+                .get(Value::String((*key).to_string()))?;
+        }
+        current.as_bool()
+    }
+
+    fn yaml_str(root: &Value, path: &[&str]) -> Option<String> {
+        let mut current = root;
+        for key in path {
+            current = current
+                .as_mapping()?
+                .get(Value::String((*key).to_string()))?;
+        }
+        current.as_str().map(|s| s.to_string())
+    }
+
+    #[test]
+    fn render_keeps_tun_on_overlay_when_subscription_omits_tun() {
+        let subscription = parse_yaml(
+            r#"
+proxies: []
+rules:
+  - MATCH,DIRECT
+"#,
+        );
+        let mut overlay = Value::Mapping(serde_yaml::Mapping::new());
+        crate::tun::apply_tun_policy_overlay_for(&mut overlay, true, "linux");
+        let rendered = merge_subscription_overlay(subscription, Some(&overlay), false);
+        assert_eq!(yaml_bool(&rendered, &["tun", "enable"]), Some(true));
+        assert_eq!(yaml_bool(&rendered, &["tun", "auto-redirect"]), Some(true));
+        assert_eq!(yaml_bool(&rendered, &["tun", "auto-route"]), Some(true));
+        assert_eq!(yaml_bool(&rendered, &["dns", "enable"]), Some(true));
+        assert_eq!(
+            yaml_str(&rendered, &["dns", "enhanced-mode"]).as_deref(),
+            Some("fake-ip")
+        );
+    }
+
+    #[test]
+    fn render_keeps_tun_on_overlay_when_subscription_disables_tun() {
+        let subscription = parse_yaml(
+            r#"
+tun:
+  enable: false
+proxies: []
+rules:
+  - MATCH,DIRECT
+"#,
+        );
+        let mut overlay = Value::Mapping(serde_yaml::Mapping::new());
+        crate::tun::apply_tun_policy_overlay_for(&mut overlay, true, "linux");
+        let rendered = merge_subscription_overlay(subscription, Some(&overlay), false);
+        assert_eq!(yaml_bool(&rendered, &["tun", "enable"]), Some(true));
+        assert_eq!(yaml_bool(&rendered, &["tun", "auto-redirect"]), Some(true));
+    }
+
+    #[test]
+    fn render_applies_tun_off_overlay() {
+        let subscription = parse_yaml(
+            r#"
+tun:
+  enable: true
+  auto-redirect: true
+proxies: []
+"#,
+        );
+        let mut overlay = Value::Mapping(serde_yaml::Mapping::new());
+        crate::tun::apply_tun_policy_overlay(&mut overlay, true);
+        crate::tun::apply_tun_policy_overlay(&mut overlay, false);
+        let rendered = merge_subscription_overlay(subscription, Some(&overlay), false);
+        assert_eq!(yaml_bool(&rendered, &["tun", "enable"]), Some(false));
     }
 }
