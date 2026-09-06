@@ -7,8 +7,8 @@ use anyhow::{Context, Result};
 pub const AUTO_SUDO_ENV: &str = "CLASH_CLI_SUDO_REEXEC";
 pub const AUTO_SUDO_DISABLE_ENV: &str = "CLASH_CLI_NO_AUTO_SUDO";
 
-pub fn should_auto_delegate(json_mode: bool) -> bool {
-    if json_mode {
+pub fn should_auto_delegate(machine_mode: bool) -> bool {
+    if machine_mode {
         return false;
     }
     if env::var_os(AUTO_SUDO_DISABLE_ENV).is_some() {
@@ -23,7 +23,7 @@ pub fn should_auto_delegate(json_mode: bool) -> bool {
     crate::utils::command_exists("sudo")
 }
 
-pub fn run_with_sudo<F>(json_mode: bool, mut append_args: F) -> Result<ExitStatus>
+pub fn run_with_sudo<F>(machine_mode: bool, mut append_args: F) -> Result<ExitStatus>
 where
     F: FnMut(&mut Command) -> Result<()>,
 {
@@ -35,8 +35,8 @@ where
         cmd.arg(format!("CLASH_CLI_HOME={}", home.to_string_lossy()));
     }
     cmd.arg(exe);
-    if json_mode {
-        cmd.arg("--json");
+    if machine_mode {
+        cmd.arg("--machine");
     }
     append_args(&mut cmd)?;
     cmd.status().context("启动 sudo 失败")

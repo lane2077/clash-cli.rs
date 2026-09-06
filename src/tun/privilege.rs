@@ -4,7 +4,8 @@ use anyhow::{Context, Result, bail};
 
 use crate::auto_sudo;
 use crate::cli::TunApplyArgs;
-use crate::output::is_json_mode;
+use crate::machine::{ErrorCode, coded_error};
+use crate::output::is_machine_mode;
 use crate::utils;
 
 pub(super) const CAP_NET_ADMIN_BIT: u32 = 12;
@@ -54,18 +55,20 @@ fn ensure_tun_privileges() -> Result<()> {
         if is_root {
             return Ok(());
         }
-        bail!(
-            "macOS 开启 TUN 需要 root（创建 utun / 改路由）。请使用 sudo，例如 `sudo clash tun on`"
-        );
+        return Err(coded_error(
+            ErrorCode::PermissionRequired,
+            "macOS 开启 TUN 需要 root（创建 utun / 改路由）。请使用 sudo，例如 `sudo clash tun on`",
+        ));
     }
     let has_admin = has_capability_bit(CAP_NET_ADMIN_BIT).unwrap_or(false);
     let has_raw = has_capability_bit(CAP_NET_RAW_BIT).unwrap_or(false);
     if is_root || (has_admin && has_raw) {
         return Ok(());
     }
-    bail!(
-        "当前权限不足：需要 root 或 CAP_NET_ADMIN + CAP_NET_RAW。请使用 sudo 执行，例如 `sudo clash tun on`"
-    );
+    Err(coded_error(
+        ErrorCode::PermissionRequired,
+        "当前权限不足：需要 root 或 CAP_NET_ADMIN + CAP_NET_RAW。请使用 sudo 执行，例如 `sudo clash tun on`",
+    ))
 }
 
 pub(super) fn ensure_tun_privileges_or_delegate(
@@ -80,12 +83,12 @@ pub(super) fn ensure_tun_privileges_or_delegate(
         return Ok(PrivilegeCheck::Ok);
     }
 
-    if !auto_sudo::should_auto_delegate(is_json_mode()) {
+    if !auto_sudo::should_auto_delegate(is_machine_mode()) {
         ensure_tun_privileges()?;
         return Ok(PrivilegeCheck::Ok);
     }
 
-    if !is_json_mode() {
+    if !is_machine_mode() {
         println!(
             "检测到权限不足，正在请求 sudo 授权继续执行 `clash tun {}` ...",
             action.as_cli_str()
@@ -108,11 +111,11 @@ pub(super) fn ensure_tun_doctor_privileges_or_delegate() -> Result<PrivilegeChec
         return Ok(PrivilegeCheck::Ok);
     }
 
-    if !auto_sudo::should_auto_delegate(is_json_mode()) {
+    if !auto_sudo::should_auto_delegate(is_machine_mode()) {
         return Ok(PrivilegeCheck::Ok);
     }
 
-    if !is_json_mode() {
+    if !is_machine_mode() {
         println!("检测到权限不足，正在请求 sudo 授权继续执行 `clash tun doctor` ...");
     }
 
@@ -127,7 +130,7 @@ fn run_tun_apply_with_sudo(
     action: TunAction,
     args: &TunApplyArgs,
 ) -> Result<std::process::ExitStatus> {
-    auto_sudo::run_with_sudo(is_json_mode(), |cmd| {
+    auto_sudo::run_with_sudo(is_machine_mode(), |cmd| {
         cmd.arg("tun");
         cmd.arg(action.as_cli_str());
         cmd.arg("--name");
@@ -143,7 +146,7 @@ fn run_tun_apply_with_sudo(
 }
 
 fn run_tun_doctor_with_sudo() -> Result<std::process::ExitStatus> {
-    auto_sudo::run_with_sudo(is_json_mode(), |cmd| {
+    auto_sudo::run_with_sudo(is_machine_mode(), |cmd| {
         cmd.arg("tun").arg(TunAction::Doctor.as_cli_str());
         Ok(())
     })

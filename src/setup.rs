@@ -10,13 +10,13 @@ use anyhow::{Context, Result, bail};
 use crate::api;
 use crate::auto_sudo;
 use crate::cli::{
-    Amd64Variant, ApiCommand, ApiCommonArgs, CoreCommand, CoreInstallArgs, MirrorSource,
-    ProfileAddArgs, ProfileCommand, ProfileFetchArgs, ProfileRenderArgs, ProfileUseArgs,
-    ServiceCommand, ServiceInstallArgs, ServiceTargetArgs, SetupCommand, SetupInitArgs,
-    SetupUnifyArgs, TunApplyArgs, TunCommand, UiCommand, UiInstallArgs,
+    Amd64Variant, ApiCommonArgs, CoreCommand, CoreInstallArgs, MirrorSource, ProfileAddArgs,
+    ProfileCommand, ProfileFetchArgs, ProfileRenderArgs, ProfileUpdateArgs, ServiceCommand,
+    ServiceInstallArgs, ServiceTargetArgs, SetupCommand, SetupInitArgs, SetupUnifyArgs,
+    TunApplyArgs, TunCommand, UiCommand, UiInstallArgs,
 };
 use crate::core;
-use crate::output::is_json_mode;
+use crate::output::is_machine_mode;
 use crate::paths::app_paths;
 use crate::profile::{self, ProfileEntry, ProfileIndex, load_index, save_index};
 use crate::service;
@@ -39,11 +39,8 @@ fn cmd_init(args: SetupInitArgs) -> Result<()> {
         return Ok(());
     }
     ensure_root_user()?;
-    if is_json_mode() {
-        bail!("`setup init` 暂不支持 --json，请先去掉 --json 执行");
-    }
-    if args.profile_url.trim().is_empty() {
-        bail!("`--profile-url` 不能为空");
+    if args.sub_url.trim().is_empty() {
+        bail!("`--sub-url` 不能为空");
     }
 
     ensure_setup_home_for_root();
@@ -85,9 +82,9 @@ fn cmd_init(args: SetupInitArgs) -> Result<()> {
     }
     println!("服务内核路径: {}", paths.core_current_link.display());
 
-    ensure_profile_ready(&args.profile_name, &args.profile_url, &args.service_name)?;
+    ensure_profile_ready(&args.sub_name, &args.sub_url)?;
     profile::run(ProfileCommand::Render(ProfileRenderArgs {
-        name: Some(args.profile_name.clone()),
+        name: Some(args.sub_name.clone()),
         output: None,
         no_mixin: false,
         follow_subscription_port: false,
@@ -138,11 +135,11 @@ fn cmd_init(args: SetupInitArgs) -> Result<()> {
         );
     }
     println!("工作目录: {}", workdir.display());
-    api::run(ApiCommand::UiUrl(ApiCommonArgs {
+    api::run_ui_url(ApiCommonArgs {
         controller: None,
         secret: None,
         timeout_secs: 15,
-    }))?;
+    })?;
     println!("可直接执行: clash proxy start");
     println!("当前终端生效: eval \"$(clash env on)\"");
     Ok(())
@@ -170,9 +167,6 @@ fn cmd_unify(args: SetupUnifyArgs) -> Result<()> {
         return Ok(());
     }
     ensure_root_user()?;
-    if is_json_mode() {
-        bail!("`setup unify` 暂不支持 --json，请先去掉 --json 执行");
-    }
 
     ensure_setup_home_for_root();
     let paths = app_paths()?;
@@ -239,7 +233,7 @@ fn cmd_unify(args: SetupUnifyArgs) -> Result<()> {
         );
     }
     if let Some(active) = index.active.as_deref() {
-        println!("当前 active profile: {}", active);
+        println!("当前 active 订阅: {}", active);
     }
 
     for w in warnings {
@@ -254,11 +248,9 @@ fn cmd_unify(args: SetupUnifyArgs) -> Result<()> {
     let active = index
         .active
         .clone()
-        .context("收敛后没有可用 active profile，无法 apply")?;
-    profile::run(ProfileCommand::Use(ProfileUseArgs {
-        name: active,
-        apply: true,
-        fetch: true,
+        .context("收敛后没有可用 active 订阅，无法应用")?;
+    profile::run(ProfileCommand::Update(ProfileUpdateArgs {
+        name: Some(active),
         service_name: args.service_name.clone(),
         no_restart: false,
     }))?;
@@ -269,33 +261,25 @@ fn cmd_unify(args: SetupUnifyArgs) -> Result<()> {
     Ok(())
 }
 
-fn ensure_profile_ready(name: &str, url: &str, service_name: &str) -> Result<()> {
+fn ensure_profile_ready(name: &str, url: &str) -> Result<()> {
     let add_result = profile::run(ProfileCommand::Add(ProfileAddArgs {
         name: name.to_string(),
         url: url.to_string(),
-        use_profile: true,
-        no_fetch: false,
+        fetch: true,
     }));
     match add_result {
         Ok(()) => Ok(()),
-        Err(err) => {
-            if err.to_string().contains("profile 已存在") {
-                println!("profile 已存在，执行强制拉取并切换: {}", name);
-                profile::run(ProfileCommand::Fetch(ProfileFetchArgs {
-                    name: name.to_string(),
-                    force: true,
-                }))?;
-                profile::run(ProfileCommand::Use(ProfileUseArgs {
-                    name: name.to_string(),
-                    apply: false,
-                    fetch: false,
-                    service_name: service_name.to_string(),
-                    no_restart: true,
-                }))?;
-                return Ok(());
-            }
-            Err(err)
+        Err(err)
+            if crate::machine::classify_error(&err)
+                == crate::machine::ErrorCode::ProfileAlreadyExists =>
+        {
+            println!("订阅已存在，执行强制拉取: {}", name);
+            profile::run(ProfileCommand::Fetch(ProfileFetchArgs {
+                name: name.to_string(),
+                force: true,
+            }))
         }
+        Err(err) => Err(err),
     }
 }
 
@@ -330,7 +314,7 @@ fn ensure_root_user() -> Result<()> {
     }
     if !utils::is_root_user() {
         bail!(
-            "请使用 root 执行，例如: sudo env CLASH_CLI_HOME=/etc/clash-cli clash setup init --profile-url <URL>"
+            "请使用 root 执行，例如: sudo env CLASH_CLI_HOME=/etc/clash-cli clash setup init --sub-url <URL>"
         );
     }
     Ok(())
@@ -375,11 +359,11 @@ fn ensure_setup_privileges_or_delegate(action: SetupAction<'_>) -> Result<Privil
             return Ok(PrivilegeCheck::Ok);
         }
     }
-    if !auto_sudo::should_auto_delegate(is_json_mode()) {
+    if !auto_sudo::should_auto_delegate(is_machine_mode()) {
         return Ok(PrivilegeCheck::Ok);
     }
 
-    if !is_json_mode() {
+    if !is_machine_mode() {
         let action_name = match action {
             SetupAction::Init(_) => "setup init",
             SetupAction::Unify(_) => "setup unify",
@@ -395,7 +379,7 @@ fn ensure_setup_privileges_or_delegate(action: SetupAction<'_>) -> Result<Privil
 }
 
 fn run_setup_with_sudo(action: SetupAction<'_>) -> Result<std::process::ExitStatus> {
-    auto_sudo::run_with_sudo(is_json_mode(), |cmd| {
+    auto_sudo::run_with_sudo(is_machine_mode(), |cmd| {
         cmd.arg("setup");
         match action {
             SetupAction::Init(args) => append_setup_init_args(cmd, args),
@@ -407,8 +391,8 @@ fn run_setup_with_sudo(action: SetupAction<'_>) -> Result<std::process::ExitStat
 
 fn append_setup_init_args(cmd: &mut Command, args: &SetupInitArgs) {
     cmd.arg("init");
-    cmd.arg("--profile-url").arg(&args.profile_url);
-    cmd.arg("--profile-name").arg(&args.profile_name);
+    cmd.arg("--sub-url").arg(&args.sub_url);
+    cmd.arg("--sub-name").arg(&args.sub_name);
     cmd.arg("--core-version").arg(&args.core_version);
     cmd.arg("--mirror").arg(mirror_source_str(args.mirror));
     cmd.arg("--amd64-variant")

@@ -1,74 +1,76 @@
 # AI 协作说明
 
-面向 Linux 与 macOS 的 mihomo/Clash CLI（Rust）。改代码前先读本文和 `docs/AI调试.md`。
+面向 Linux 与 macOS 的 mihomo/Clash CLI（Rust）。改代码前先读本文、`docs/架构设计-v0.3.md` 和 `docs/机器契约-v0.md`。
 
-终端默认中文；**非 TTY（脚本、管道、agent 子进程）默认 JSON**，不必加 `--json`。成功 `ok: true`；失败非零退出且 JSON 含 `error`。`env on/off`（以及旧的 `proxy env`）/ `service log -f` / `setup *` 例外：stdout 保持脚本、日志或初始化进度流。强制中文用 `--text`，强制 JSON 用 `--json`。用 `CLASH_CLI_HOME` 隔离状态。
+## 最重要的接口规则
 
-日常命令对齐 Clash Verge 菜单：`sub`（订阅，`profile` 是别名）、`proxy`（代理组/节点）、`system`（系统代理）、`tun`、`mode`（出站模式）、`env`（复制环境变量）、`ui`（仪表板）。终端 HTTP `proxy start/stop/auto` 仍可用，但不出现在 `proxy --help` 的主说明里。
+人类 CLI 与 Machine Contract 是两层不同接口：
+
+- 不带 `--machine`：始终输出人类文本，不根据 TTY/管道自动改格式。
+- 带 `--machine`：只输出 `clash.machine/v0` envelope。
+- Machine Contract 必须显式开启；没有环境变量开关。
+- machine 模式禁止自动 sudo、交互式一键编排、浏览器打开和无限日志流。
+- canonical 命令只有 `sub / proxy / system / tun / mode / env / ui / core / service / api / update`；不要重新添加同义别名。
+- `setup` 是 human-only orchestrator；agent 应调用原子能力。
+
+Machine Contract 成功/失败都必须是单个 JSON 对象；业务模块只提供 `data`，`ok/action/status/effect/error/meta` 只能由 `src/machine.rs` / `src/output.rs` 生成。
 
 ## 验证
 
 ```bash
+cargo fmt --check
+cargo check --all-targets
+cargo clippy --all-targets -- -D warnings
 cargo test
 ```
 
-测试本身就是 harness：隔离 `CLASH_CLI_HOME`、拉起真实 `clash` 二进制、断言 JSON 契约。不要再包一层 shell 入口。
+**测试不允许真实执行 TUN、修改系统代理或操作真实服务。** TUN 只测纯配置/状态函数；系统命令使用 mock。使用 `CLASH_CLI_HOME` 隔离状态。
 
 ## 目录
 
 | 路径 | 职责 |
-|------|------|
-| `src/lib.rs` | 薄分发：Verge 动词进对应域；`clash_cli::harness` 给测试/AI 的纯函数 |
-| `src/main.rs` | 薄二进制 |
-| `src/cli.rs` | clap 类型；`ProxyCommand::into_node_api` 把代理组从终端 env 拆开 |
-| `src/profile.rs` | `sub`/`profile`：订阅 + mixin 合成 runtime（唯一 YAML writer） |
-| `src/api.rs` | mihomo HTTP：`proxy list/switch`、`mode`、`api *` |
-| `src/proxy.rs` | 终端 env / `proxy start` / 桌面 `system`（不写 runtime YAML、不调 HTTP） |
-| `src/system_proxy.rs` | GNOME/macOS 系统代理命令 |
-| `src/tun/` | tun overlay / doctor / status；只改 mixin 再走 profile 合成 |
-| `src/service.rs` | systemd unit / launchd plist；默认启动 `core/mihomo` 软链 |
-| `tests/common/mod.rs` | 隔离 home、跑二进制、断言 JSON |
-| `tests/fixtures/` | 订阅 YAML 样例 |
-| `tests/harness_api.rs` | 直接调库函数 |
-| `tests/cli_harness.rs` | 真实 CLI 契约（含失败 JSON） |
+|---|---|
+| `src/lib.rs` | 最外层分发；设置 canonical action / machine 语义 |
+| `src/machine.rs` | Machine Contract v0、错误码、effect、契约自描述 |
+| `src/output.rs` | machine envelope 唯一输出边界 |
+| `src/cli.rs` | clap 类型、canonical action、machine capability/输入约束 |
+| `src/profile.rs` | `sub`：订阅 + mixin 合成 runtime（唯一 YAML writer） |
+| `src/api.rs` | mihomo HTTP：节点、mode、连接、配置等 |
+| `src/proxy.rs` | 人类终端 env 状态，以及顶层 env/system 的实现 |
+| `src/system_proxy.rs` | GNOME/macOS 系统代理适配器 |
+| `src/tun/` | TUN overlay / doctor / status；数据面归 mihomo |
+| `src/service.rs` | systemd / launchd 适配器 |
+| `src/core.rs` | mihomo 下载、校验、版本软链 |
+| `src/ui.rs` | Web UI |
+| `tests/cli_harness.rs` | Machine Contract 与关键状态不变量 |
+| `tests/harness_api.rs` | 无系统副作用的纯函数测试 |
 
-## 平台
+## 状态模型
 
-支持 **Linux 与 macOS**。Windows 仍不支持。
+不要再把一个 `enabled` 当成所有状态。至少区分：
 
-- Linux：systemd + `/dev/net/tun` + 可选 nft auto-redirect
-- macOS：launchd + mihomo utun/auto-route；TUN 通常需要 sudo
-- 不要把 macOS 上的失败当成「仅支持 Linux」
+1. **期望状态**：用户/命令要求什么。
+2. **已提交状态**：配置/index 已经写成什么。
+3. **运行状态**：service/process 是否运行。
+4. **观测状态**：接口/系统设置是否真的生效。
 
-## 模块（深：小接口后面藏行为）
+machine 的 `effect.state_changed` 表示命令是否改变了状态；`effect.verified` 表示结果是否被观测验证。写操作默认 `verified=false`，除非代码明确做了 postcondition 检查。
 
-改代码时用这些词：模块、接口、seam、适配器、深度。不要为测试再抽一层过路函数。
+## 核心不变量
 
-- **订阅生效** seam：`apply_subscription`（拉取 / 合成 runtime / 重启）。`sub use --apply` 与 `sub update` 都穿过它。测试也穿过它。
-- **合成** seam：`merge_subscription_overlay` / `render_runtime_from_home`。`tun on/off` 只改 mixin，再走合成。
-- **节点 vs 终端 env** seam：`ProxyCommand::into_node_api`。systemd 与 launchd 是服务生命周期的两个适配器，plist/unit 生成函数是接口。
+1. runtime 只允许合成管道写出：订阅 YAML + `profiles/mixin.yaml` → `runtime/config.yaml`。
+2. 再次 render 不得冲掉 overlay 里的 TUN 策略。
+3. `sub use/update` 失败不得留下 active/runtime 半状态。
+4. 远端异常文本不得覆盖已有有效订阅/runtime。
+5. systemd/launchd 的“命令执行”“已加载”“正在运行”不得混为一谈。
+6. 默认 systemd ExecStart 指向 `core/mihomo` 软链。
+7. doctor 遇到 Docker 网桥不得建议 `include-interface` / `exclude-interface`。
+8. Machine Contract 不得靠错误文案推断关键错误；重要分支使用 `CodedError`。
+9. machine 写操作若目标存在歧义，应要求显式输入，而不是静默取 active/default。
 
-## 不变量（回归时优先查）
+## 测试原则
 
-1. **runtime 只允许合成管道写出**：订阅 YAML + `profiles/mixin.yaml` → `runtime/config.yaml`。`tun on/off` 只改 mixin，再 `render`。
-2. **再次 render 不得冲掉 overlay 里的 `tun.enable` / `tun.auto-redirect`。**
-3. **默认 systemd ExecStart 指向 `core/mihomo` 软链**，不是 `/usr/local/bin/mihomo` 拷贝。
-4. **tun 实际状态**不要求 CLI 自建 `clash_cli_tun` / `CLASH_CLI_TUN` 表；数据面归 mihomo `auto-redirect`。
-5. **doctor 遇到 Docker 网桥不得建议 `include-interface` / `exclude-interface`。**
-
-## 怎么加测试
-
-- 纯逻辑：在 `tests/harness_api.rs` 调 `clash_cli::harness::*`，或在对应模块的 `#[cfg(test)]` 里调同一函数。禁止再实现一份 merge 规则当 oracle。
-- CLI：用 `tests/common` 的 `temp_home` + `run_with_home`，设 `CLASH_CLI_HOME`，并加 `CLASH_CLI_NO_AUTO_SUDO=1`。
-- 不要把配置目录指到临时 scratch 以外的真实 `~/.config`。
-- 管道里失败形态必须是 `{"ok": false, "error": "..."}`（不必加 `--json`）。
-
-## 常用命令
-
-```bash
-cargo test
-cargo test --test harness_api
-cargo test --test cli_harness
-CLASH_CLI_HOME="$PWD/target/debug-home" cargo run -- sub list
-CLASH_CLI_HOME="$PWD/target/debug-home" cargo run -- --text profile list
-```
+- CLI machine 测试：`--machine` + 临时 `CLASH_CLI_HOME`。
+- HTTP 测试显式指向 mock/不可用测试端口，不能碰真实 `127.0.0.1:9090`。
+- 不允许 `run_from_args([..., "tun", "on/off", ...])` 这类有机会修改宿主系统的测试。
+- 纯逻辑直接测生产 seam，不复制一份实现当 oracle。

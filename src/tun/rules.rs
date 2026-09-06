@@ -1,6 +1,6 @@
 use anyhow::{Result, bail};
 
-use crate::output::is_json_mode;
+use crate::output::is_machine_mode;
 use crate::utils::{check_cmd_success, command_exists};
 
 use super::state::RuleBackend;
@@ -43,7 +43,7 @@ pub(super) fn cleanup_dataplane_rules_all() -> Result<()> {
 
 pub(super) fn cleanup_dataplane_rules_all_best_effort() {
     if let Err(err) = cleanup_dataplane_rules_all()
-        && !is_json_mode()
+        && !is_machine_mode()
     {
         eprintln!("警告: 清理历史规则失败: {}", err);
     }

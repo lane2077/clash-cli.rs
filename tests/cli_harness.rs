@@ -1,503 +1,374 @@
-//! CLI 调试 harness：覆盖 JSON 契约、失败形态，以及 macOS 上不再 Linux-only 的命令。
+//! Machine Contract v0 + 关键状态不变量。
+//! 不执行任何真实 TUN 命令。
 
 mod common;
 
 use common::{
-    assert_json_err, assert_json_ok, fixture_text, read_runtime_yaml, run_with_home, temp_home,
-    write_profile, yaml_bool,
+    assert_machine_err, assert_machine_ok, binary_path, fixture_text, run_with_home, temp_home,
+    write_profile,
 };
 use std::fs;
+use std::process::Command;
 
 #[test]
-fn json_error_shape_when_profile_missing() {
-    let home = temp_home("json_err_missing_profile");
-    let output = run_with_home(&home, &["--json", "profile", "use", "--name", "no-such"]);
-    let value = assert_json_err(&output);
-    let error = value["error"].as_str().unwrap();
-    assert!(
-        error.contains("profile 不存在"),
-        "错误文案应指向缺失 profile: {error}"
-    );
+fn help_exposes_machine_not_legacy_json_or_profile_alias() {
+    let output = Command::new(binary_path()).arg("--help").output().unwrap();
+    assert!(output.status.success());
+    let text = String::from_utf8_lossy(&output.stdout);
+    assert!(text.contains("--machine"));
+    assert!(!text.contains("--json"));
+    assert!(!text.contains("--text"));
+    assert!(text.contains("  sub "));
+    assert!(!text.contains("aliases: profile"));
+}
+
+#[test]
+fn machine_sub_list_has_stable_read_envelope() {
+    let home = temp_home("machine_sub_list");
+    let output = run_with_home(&home, &["--machine", "sub", "list"]);
+    let value = assert_machine_ok(&output, "sub.list");
+    assert_eq!(value["status"], "success");
+    assert_eq!(value["effect"]["state_changed"], false);
+    assert_eq!(value["effect"]["verified"], true);
+    assert_eq!(value["data"]["active"], serde_json::Value::Null);
+    assert_eq!(value["data"]["subscriptions"], serde_json::json!([]));
     let _ = fs::remove_dir_all(&home);
 }
 
 #[test]
-fn json_error_shape_when_render_without_profile() {
-    let home = temp_home("json_err_render_empty");
-    let output = run_with_home(&home, &["--json", "profile", "render"]);
-    let value = assert_json_err(&output);
-    let error = value["error"].as_str().unwrap();
-    assert!(
-        error.contains("active profile") || error.contains("profile"),
-        "render 无 profile 时应给出可读错误: {error}"
-    );
-    let _ = fs::remove_dir_all(&home);
-}
-
-#[test]
-fn macos_tun_on_is_not_linux_only() {
-    if cfg!(target_os = "linux") {
-        return;
-    }
-    let home = temp_home("tun_on_macos");
-    let output = run_with_home(&home, &["tun", "on", "--no-restart"]);
-    let combined = format!(
-        "{}{}",
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr)
-    );
-    assert!(
-        !combined.contains("当前仅支持 Linux 平台"),
-        "tun on 不应再报 Linux-only: {combined}"
-    );
-    let _ = fs::remove_dir_all(&home);
-}
-
-#[test]
-fn macos_tun_off_is_not_linux_only() {
-    if cfg!(target_os = "linux") {
-        return;
-    }
-    let home = temp_home("tun_off_macos");
-    let output = run_with_home(&home, &["tun", "off", "--no-restart"]);
-    let combined = format!(
-        "{}{}",
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr)
-    );
-    assert!(
-        !combined.contains("当前仅支持 Linux 平台"),
-        "tun off 不应再报 Linux-only: {combined}"
-    );
-    assert!(
-        !combined.contains("未检测到 iptables"),
-        "tun off 不应在 macOS 上要求 iptables: {combined}"
-    );
-    assert!(
-        output.status.success(),
-        "macOS tun off 只写 overlay，不应要求 root: {combined}"
-    );
-    let _ = fs::remove_dir_all(&home);
-}
-
-#[test]
-fn macos_service_status_is_not_linux_only() {
-    if cfg!(target_os = "linux") {
-        return;
-    }
-    let home = temp_home("service_macos");
-    let output = run_with_home(&home, &["service", "status"]);
-    let combined = format!(
-        "{}{}",
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr)
-    );
-    assert!(
-        !combined.contains("当前仅支持 Linux 平台"),
-        "service status 不应再报 Linux-only: {combined}"
-    );
-    let _ = fs::remove_dir_all(&home);
-}
-
-#[test]
-fn proxy_start_status_env_json_roundtrip() {
-    let home = temp_home("proxy_roundtrip");
-    let start = run_with_home(
-        &home,
-        &[
-            "--json",
-            "proxy",
-            "start",
-            "--host",
-            "127.0.0.1",
-            "--http-port",
-            "17890",
-            "--socks-port",
-            "17891",
-        ],
-    );
-    let start_json = assert_json_ok(&start);
-    assert_eq!(start_json["action"], "proxy.start");
-
-    let status = run_with_home(&home, &["--json", "proxy", "status"]);
-    let status_json = assert_json_ok(&status);
-    assert_eq!(status_json["action"], "proxy.status");
-
-    let env_on = run_with_home(&home, &["--json", "proxy", "env", "on"]);
-    let env_json = assert_json_ok(&env_on);
-    let script = env_json["script"].as_str().expect("缺少 script");
-    assert!(
-        script.contains("17890"),
-        "export 脚本应包含 http 端口: {script}"
-    );
-    assert!(
-        script.contains("17891"),
-        "export 脚本应包含 socks 端口: {script}"
-    );
-
-    let stop = run_with_home(&home, &["--json", "proxy", "stop"]);
-    assert_json_ok(&stop);
-    let _ = fs::remove_dir_all(&home);
-}
-
-#[test]
-fn profile_validate_and_render_from_fixture() {
-    let home = temp_home("validate_render");
-    write_profile(&home, &fixture_text("subscription-no-tun.yaml"));
-
-    let validate = run_with_home(&home, &["--json", "profile", "validate"]);
-    let validate_json = assert_json_ok(&validate);
-    assert_eq!(validate_json["action"], "profile.validate");
-
-    let mixin = run_with_home(
-        &home,
-        &[
-            "--json",
-            "profile",
-            "mixin",
-            "set",
-            "--key",
-            "tun.enable",
-            "--value",
-            "true",
-        ],
-    );
-    assert_json_ok(&mixin);
-
-    let render = run_with_home(&home, &["--json", "profile", "render"]);
-    let render_json = assert_json_ok(&render);
-    assert_eq!(render_json["action"], "profile.render");
-    assert_eq!(render_json["ok"], true);
-
-    let runtime = read_runtime_yaml(&home);
-    assert_eq!(yaml_bool(&runtime, &["tun", "enable"]), Some(true));
-    let _ = fs::remove_dir_all(&home);
-}
-
-#[test]
-fn profile_use_apply_without_systemctl_does_not_query_execstart() {
-    let home = temp_home("use_apply_no_sysctl");
-    write_profile(&home, &fixture_text("subscription-no-tun.yaml"));
-    let output = run_with_home(
-        &home,
-        &[
-            "--json",
-            "profile",
-            "use",
-            "--name",
-            "main",
-            "--apply",
-            "--service-name",
-            "clash-cli-harness-uninstalled",
-        ],
-    );
-    let combined = format!(
-        "{}{}",
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr)
-    );
-    assert!(
-        !combined.contains("读取 service ExecStart 失败"),
-        "无 systemctl 时 use --apply 不得硬失败: {combined}"
-    );
-    if cfg!(not(target_os = "linux")) {
-        assert!(
-            !combined.contains("ExecStart"),
-            "Darwin use --apply 不应查询 systemd ExecStart: {combined}"
-        );
-        assert!(
-            !combined.to_lowercase().contains("systemctl"),
-            "Darwin use --apply 失败应走 launchd，而不是 systemctl: {combined}"
-        );
-    }
-    let _ = fs::remove_dir_all(&home);
-}
-
-#[test]
-fn json_profile_use_apply_emits_single_object() {
-    let home = temp_home("use_apply_json");
-    write_profile(&home, &fixture_text("subscription-no-tun.yaml"));
-    let output = run_with_home(
-        &home,
-        &[
-            "--json",
-            "profile",
-            "use",
-            "--name",
-            "main",
-            "--apply",
-            "--no-restart",
-        ],
-    );
-    let value = assert_json_ok(&output);
-    assert_eq!(value["action"], "profile.use");
-    assert_eq!(value["applied"], true);
-    assert_eq!(value["restarted"], false);
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let parsed: serde_json::Value =
-        serde_json::from_str(stdout.trim()).expect("stdout 必须是单个 JSON 对象");
-    assert_eq!(parsed["action"], "profile.use");
-    let runtime = read_runtime_yaml(&home);
-    assert_eq!(
-        runtime.get("mode").and_then(|v| v.as_str()),
-        Some("rule"),
-        "use --apply 应把订阅写进 runtime: {runtime:?}"
-    );
-    assert!(
-        runtime.get("rules").is_some(),
-        "use --apply 的 runtime 应含订阅 rules"
-    );
-    let _ = fs::remove_dir_all(&home);
-}
-
-#[test]
-fn json_profile_validate_warnings_still_ok_true() {
-    let home = temp_home("validate_warnings");
-    write_profile(&home, "mode: rule\n");
-    let output = run_with_home(&home, &["--json", "profile", "validate"]);
-    assert!(
-        output.status.success(),
-        "validate 有 warnings 时仍应退出 0: stderr={}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-    let value = assert_json_ok(&output);
-    assert_eq!(value["action"], "profile.validate");
-    assert!(
-        value["warnings"]
-            .as_array()
-            .map(|a| !a.is_empty())
-            .unwrap_or(false),
-        "应返回 warnings 数组: {value}"
-    );
-    assert!(value.get("error").is_none() || value["error"].is_null());
-    let _ = fs::remove_dir_all(&home);
-}
-
-#[test]
-fn profile_update_help_describes_fetch_and_apply() {
-    let output = std::process::Command::new(common::binary_path())
-        .args(["profile", "update", "--help"])
-        .output()
-        .expect("help 失败");
+fn piped_human_output_does_not_silently_become_machine_json() {
+    let home = temp_home("human_pipe");
+    let output = run_with_home(&home, &["sub", "list"]);
     assert!(output.status.success());
     let stdout = String::from_utf8_lossy(&output.stdout);
-    assert!(stdout.contains("fetch") || stdout.contains("拉取"));
-    assert!(stdout.contains("渲染") || stdout.contains("生效"));
+    assert!(stdout.contains("暂无"));
+    assert!(serde_json::from_str::<serde_json::Value>(stdout.trim()).is_err());
+    let _ = fs::remove_dir_all(&home);
 }
 
 #[test]
-fn profile_update_offline_file_url_renders() {
-    let home = temp_home("profile_update");
+fn machine_parse_error_has_typed_code() {
+    let home = temp_home("parse_error");
+    let output = run_with_home(&home, &["--machine", "sub", "does-not-exist"]);
+    let value = assert_machine_err(&output, "cli.parse", "CLI_ARGUMENT_INVALID");
+    assert_eq!(value["effect"]["state_changed"], false);
+    assert_eq!(value["error"]["retryable"], false);
+    let _ = fs::remove_dir_all(&home);
+}
+
+#[test]
+fn machine_missing_subscription_is_typed_and_non_mutating() {
+    let home = temp_home("missing_subscription");
+    let output = run_with_home(&home, &["--machine", "sub", "fetch", "--name", "missing"]);
+    let value = assert_machine_err(&output, "sub.fetch", "PROFILE_NOT_FOUND");
+    assert_eq!(value["effect"]["state_changed"], false);
+    let _ = fs::remove_dir_all(&home);
+}
+
+#[test]
+fn machine_setup_is_rejected_before_any_orchestration() {
+    let home = temp_home("setup_rejected");
+    let output = run_with_home(
+        &home,
+        &[
+            "--machine",
+            "setup",
+            "init",
+            "--sub-url",
+            "file:///definitely/not-used.yaml",
+            "--no-tun",
+        ],
+    );
+    assert_machine_err(&output, "setup.init", "UNSUPPORTED_MACHINE_ACTION");
+    assert!(!home.join("core").exists());
+    assert!(!home.join("profiles").exists());
+    let _ = fs::remove_dir_all(&home);
+}
+
+#[test]
+fn machine_follow_log_is_rejected_as_streaming_action() {
+    let home = temp_home("follow_rejected");
+    let output = run_with_home(&home, &["--machine", "service", "log", "--follow"]);
+    assert_machine_err(&output, "service.log", "UNSUPPORTED_MACHINE_ACTION");
+    let _ = fs::remove_dir_all(&home);
+}
+
+#[test]
+fn machine_env_off_is_read_only_data_not_raw_stdout() {
+    let home = temp_home("env_off_machine");
+    let output = run_with_home(&home, &["--machine", "env", "off"]);
+    let value = assert_machine_ok(&output, "env.off");
+    assert_eq!(value["effect"]["state_changed"], false);
+    let script = value["data"]["script"].as_str().unwrap();
+    assert!(script.contains("unset http_proxy"));
+    let _ = fs::remove_dir_all(&home);
+}
+
+#[test]
+fn human_env_off_remains_directly_evalable_script() {
+    let home = temp_home("env_off_human");
+    let output = run_with_home(&home, &["env", "off"]);
+    assert!(output.status.success());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.starts_with("unset http_proxy"));
+    assert!(!stdout.contains("clash.machine/v0"));
+    let _ = fs::remove_dir_all(&home);
+}
+
+#[test]
+fn successful_mutation_reports_changed_but_unverified() {
+    let home = temp_home("sub_add_effect");
+    let output = run_with_home(
+        &home,
+        &[
+            "--machine",
+            "sub",
+            "add",
+            "--name",
+            "main",
+            "--url",
+            "file:///unused",
+        ],
+    );
+    let value = assert_machine_ok(&output, "sub.add");
+    assert_eq!(value["effect"]["state_changed"], true);
+    assert_eq!(value["effect"]["verified"], false);
+    let _ = fs::remove_dir_all(&home);
+}
+
+#[test]
+fn skipped_fetch_reports_no_state_change() {
+    let home = temp_home("fetch_skip");
+    let origin = home.join("origin.yaml");
+    fs::write(&origin, "proxies: []\nrules:\n  - MATCH,DIRECT\n").unwrap();
+    let url = format!("file://{}", origin.display());
+    assert_machine_ok(
+        &run_with_home(
+            &home,
+            &["--machine", "sub", "add", "--name", "main", "--url", &url],
+        ),
+        "sub.add",
+    );
+    let first = run_with_home(&home, &["--machine", "sub", "fetch", "--name", "main"]);
+    let first_value = assert_machine_ok(&first, "sub.fetch");
+    assert_ne!(first_value["data"]["skipped"], true);
+    let output = run_with_home(&home, &["--machine", "sub", "fetch", "--name", "main"]);
+    let value = assert_machine_ok(&output, "sub.fetch");
+    assert_eq!(value["data"]["skipped"], true);
+    assert_eq!(value["effect"]["state_changed"], false);
+    let _ = fs::remove_dir_all(&home);
+}
+
+#[test]
+fn bad_upstream_never_overwrites_good_subscription_or_runtime() {
+    let home = temp_home("bad_upstream");
+    let origin = home.join("origin.yaml");
+    let good = "proxies: []\nrules:\n  - MATCH,DIRECT\nmode: rule\n";
+    fs::write(&origin, good).unwrap();
+    let url = format!("file://{}", origin.display());
+    assert_machine_ok(
+        &run_with_home(
+            &home,
+            &["--machine", "sub", "add", "--name", "main", "--url", &url],
+        ),
+        "sub.add",
+    );
+    assert_machine_ok(
+        &run_with_home(
+            &home,
+            &["--machine", "sub", "fetch", "--name", "main", "--force"],
+        ),
+        "sub.fetch",
+    );
+    assert_machine_ok(
+        &run_with_home(&home, &["--machine", "sub", "render", "--name", "main"]),
+        "sub.render",
+    );
+    let profile_path = home.join("profiles/main.yaml");
+    let runtime_path = home.join("runtime/config.yaml");
+    let before_profile = fs::read(&profile_path).unwrap();
+    let before_runtime = fs::read(&runtime_path).unwrap();
+    fs::write(&origin, "upstream temporarily unavailable\n").unwrap();
+    let output = run_with_home(
+        &home,
+        &["--machine", "sub", "fetch", "--name", "main", "--force"],
+    );
+    assert_machine_err(&output, "sub.fetch", "PROFILE_INVALID");
+    assert_eq!(fs::read(&profile_path).unwrap(), before_profile);
+    assert_eq!(fs::read(&runtime_path).unwrap(), before_runtime);
+    let _ = fs::remove_dir_all(&home);
+}
+
+#[test]
+fn machine_use_is_rejected_because_it_would_split_active_from_runtime() {
+    let home = temp_home("machine_use_rejected");
+    let output = run_with_home(&home, &["--machine", "sub", "use", "--name", "main"]);
+    assert_machine_err(&output, "sub.use", "UNSUPPORTED_MACHINE_ACTION");
+    let _ = fs::remove_dir_all(&home);
+}
+
+#[test]
+fn machine_render_requires_fetched_subscription() {
+    let home = temp_home("render_not_ready");
+    let origin = home.join("origin.yaml");
+    fs::write(&origin, "proxies: []\nrules: []\n").unwrap();
+    let url = format!("file://{}", origin.display());
+    assert_machine_ok(
+        &run_with_home(
+            &home,
+            &["--machine", "sub", "add", "--name", "main", "--url", &url],
+        ),
+        "sub.add",
+    );
+    let output = run_with_home(&home, &["--machine", "sub", "render", "--name", "main"]);
+    assert_machine_err(&output, "sub.render", "PROFILE_NOT_READY");
+    let listed = assert_machine_ok(
+        &run_with_home(&home, &["--machine", "sub", "list"]),
+        "sub.list",
+    );
+    assert!(listed["data"]["active"].is_null());
+    let _ = fs::remove_dir_all(&home);
+}
+
+#[test]
+fn machine_render_commits_runtime_and_active_together() {
+    let home = temp_home("render_commits_active");
     let origin = home.join("origin.yaml");
     fs::write(
         &origin,
         "proxies: []\nrules:\n  - MATCH,DIRECT\nmode: rule\n",
     )
-    .expect("写 origin 失败");
-    let url = format!("file://{}", origin.display());
-    let profiles = home.join("profiles");
-    fs::create_dir_all(&profiles).unwrap();
-    let index = serde_json::json!({
-        "active": "main",
-        "profiles": [{
-            "name": "main",
-            "url": url,
-            "file": "main.yaml",
-            "created_at": 1,
-            "updated_at": 1
-        }]
-    });
-    fs::write(
-        profiles.join("index.json"),
-        serde_json::to_vec_pretty(&index).unwrap(),
-    )
     .unwrap();
-    fs::write(profiles.join("main.yaml"), "proxies: []\n").unwrap();
-
-    let output = run_with_home(
-        &home,
-        &["profile", "update", "--name", "main", "--no-restart"],
+    let url = format!("file://{}", origin.display());
+    assert_machine_ok(
+        &run_with_home(
+            &home,
+            &["--machine", "sub", "add", "--name", "main", "--url", &url],
+        ),
+        "sub.add",
     );
-    let value = assert_json_ok(&output);
-    assert_eq!(value["action"], "profile.update");
-    assert_eq!(value["fetched"], true);
-    assert_eq!(value["applied"], true);
-    assert_eq!(value["restarted"], false);
-    let runtime = read_runtime_yaml(&home);
-    assert!(runtime.get("rules").is_some());
-    assert_eq!(runtime.get("mode").and_then(|v| v.as_str()), Some("rule"));
-    let via_sub = run_with_home(
-        &home,
-        &["--json", "sub", "update", "--name", "main", "--no-restart"],
+    assert_machine_ok(
+        &run_with_home(
+            &home,
+            &["--machine", "sub", "fetch", "--name", "main", "--force"],
+        ),
+        "sub.fetch",
     );
-    let sub_json = assert_json_ok(&via_sub);
-    assert_eq!(sub_json["action"], "profile.update");
-    assert_eq!(sub_json["applied"], true);
-    assert_eq!(sub_json["restarted"], false);
+    assert_machine_ok(
+        &run_with_home(&home, &["--machine", "sub", "render", "--name", "main"]),
+        "sub.render",
+    );
+    let listed = assert_machine_ok(
+        &run_with_home(&home, &["--machine", "sub", "list"]),
+        "sub.list",
+    );
+    assert_eq!(listed["data"]["active"], "main");
+    assert!(home.join("runtime/config.yaml").is_file());
     let _ = fs::remove_dir_all(&home);
 }
 
 #[test]
-fn profile_update_rejects_bad_upstream_without_overwriting_good_files() {
-    let home = temp_home("profile_bad_upstream");
-    let origin = home.join("origin.yaml");
-    let good = "proxies: []\nrules:\n  - MATCH,DIRECT\nmode: rule\n";
-    fs::write(&origin, good).unwrap();
-    let url = format!("file://{}", origin.display());
-    let profiles = home.join("profiles");
-    fs::create_dir_all(&profiles).unwrap();
-    let index = serde_json::json!({
-        "active": "main",
-        "profiles": [{"name":"main","url":url,"file":"main.yaml","created_at":1,"updated_at":1}]
-    });
-    fs::write(
-        profiles.join("index.json"),
-        serde_json::to_vec_pretty(&index).unwrap(),
-    )
-    .unwrap();
-    fs::write(profiles.join("main.yaml"), good).unwrap();
-    assert_json_ok(&run_with_home(&home, &["--json", "profile", "render"]));
-    let runtime_before = fs::read(home.join("runtime/config.yaml")).unwrap();
-    let profile_before = fs::read(profiles.join("main.yaml")).unwrap();
-
-    fs::write(&origin, "upstream temporarily unavailable\n").unwrap();
-    assert_json_err(&run_with_home(
-        &home,
-        &["--json", "profile", "update", "--no-restart"],
-    ));
-    assert_eq!(
-        fs::read(profiles.join("main.yaml")).unwrap(),
-        profile_before
-    );
-    assert_eq!(
-        fs::read(home.join("runtime/config.yaml")).unwrap(),
-        runtime_before
-    );
-    let _ = fs::remove_dir_all(&home);
-}
-
-#[test]
-fn failed_profile_use_apply_keeps_previous_active() {
-    let home = temp_home("failed_use_keeps_active");
-    write_profile(&home, &fixture_text("subscription-no-tun.yaml"));
-    let profiles = home.join("profiles");
-    let mut index: serde_json::Value =
-        serde_json::from_slice(&fs::read(profiles.join("index.json")).unwrap()).unwrap();
-    index["profiles"]
-        .as_array_mut()
-        .unwrap()
-        .push(serde_json::json!({
-            "name": "missing",
-            "url": "file:///definitely/missing/clash.yaml",
-            "file": "missing.yaml",
-            "created_at": 2,
-            "updated_at": null
-        }));
-    fs::write(
-        profiles.join("index.json"),
-        serde_json::to_vec_pretty(&index).unwrap(),
-    )
-    .unwrap();
-
-    assert_json_err(&run_with_home(
+fn duplicate_subscription_has_stable_error_code() {
+    let home = temp_home("duplicate_sub");
+    let first = run_with_home(
         &home,
         &[
-            "--json",
-            "profile",
-            "use",
+            "--machine",
+            "sub",
+            "add",
             "--name",
-            "missing",
-            "--apply",
-            "--no-restart",
+            "main",
+            "--url",
+            "file:///unused",
         ],
-    ));
-    let listed = assert_json_ok(&run_with_home(&home, &["--json", "profile", "list"]));
-    assert_eq!(listed["active"], "main");
+    );
+    assert_machine_ok(&first, "sub.add");
+    let second = run_with_home(
+        &home,
+        &[
+            "--machine",
+            "sub",
+            "add",
+            "--name",
+            "main",
+            "--url",
+            "file:///other",
+        ],
+    );
+    assert_machine_err(&second, "sub.add", "PROFILE_ALREADY_EXISTS");
     let _ = fs::remove_dir_all(&home);
 }
 
 #[test]
-fn named_profile_update_also_commits_active_profile() {
-    let home = temp_home("named_update_active");
-    let profiles = home.join("profiles");
-    fs::create_dir_all(&profiles).unwrap();
-    let first_origin = home.join("first.yaml");
-    let second_origin = home.join("second.yaml");
-    fs::write(
-        &first_origin,
-        "proxies: []\nrules: [MATCH,DIRECT]\nmode: rule\n",
-    )
-    .unwrap();
-    fs::write(
-        &second_origin,
-        "proxies: []\nrules: [MATCH,REJECT]\nmode: global\n",
-    )
-    .unwrap();
-    let index = serde_json::json!({
-        "active": "first",
-        "profiles": [
-            {"name":"first","url":format!("file://{}", first_origin.display()),"file":"first.yaml","created_at":1,"updated_at":1},
-            {"name":"second","url":format!("file://{}", second_origin.display()),"file":"second.yaml","created_at":2,"updated_at":1}
-        ]
-    });
-    fs::write(
-        profiles.join("index.json"),
-        serde_json::to_vec_pretty(&index).unwrap(),
-    )
-    .unwrap();
-    fs::write(
-        profiles.join("first.yaml"),
-        fs::read(&first_origin).unwrap(),
-    )
-    .unwrap();
-    fs::write(
-        profiles.join("second.yaml"),
-        fs::read(&second_origin).unwrap(),
-    )
-    .unwrap();
+fn machine_cannot_remove_active_runtime_source() {
+    let home = temp_home("remove_active");
+    let origin = home.join("origin.yaml");
+    fs::write(&origin, "proxies: []\nrules: []\n").unwrap();
+    let url = format!("file://{}", origin.display());
+    assert_machine_ok(
+        &run_with_home(
+            &home,
+            &["--machine", "sub", "add", "--name", "main", "--url", &url],
+        ),
+        "sub.add",
+    );
+    assert_machine_ok(
+        &run_with_home(
+            &home,
+            &["--machine", "sub", "fetch", "--name", "main", "--force"],
+        ),
+        "sub.fetch",
+    );
+    assert_machine_ok(
+        &run_with_home(&home, &["--machine", "sub", "render", "--name", "main"]),
+        "sub.render",
+    );
+    let remove = run_with_home(&home, &["--machine", "sub", "remove", "--name", "main"]);
+    assert_machine_err(&remove, "sub.remove", "STATE_CONFLICT");
+    assert!(home.join("profiles/main.yaml").is_file());
+    assert!(home.join("runtime/config.yaml").is_file());
+    let _ = fs::remove_dir_all(&home);
+}
 
-    assert_json_ok(&run_with_home(
+#[test]
+fn machine_rejects_composite_subscription_shortcuts() {
+    let home = temp_home("composite_sub");
+    let update = run_with_home(
         &home,
         &[
-            "--json",
-            "profile",
+            "--machine",
+            "sub",
             "update",
             "--name",
-            "second",
+            "main",
             "--no-restart",
         ],
-    ));
-    let listed = assert_json_ok(&run_with_home(&home, &["--json", "profile", "list"]));
-    assert_eq!(listed["active"], "second");
-    let runtime = read_runtime_yaml(&home);
-    assert_eq!(runtime.get("mode").and_then(|v| v.as_str()), Some("global"));
+    );
+    assert_machine_err(&update, "sub.update", "UNSUPPORTED_MACHINE_ACTION");
+    let add = run_with_home(
+        &home,
+        &[
+            "--machine",
+            "sub",
+            "add",
+            "--name",
+            "main",
+            "--url",
+            "file:///unused",
+            "--fetch",
+        ],
+    );
+    assert_machine_err(&add, "sub.add", "UNSUPPORTED_MACHINE_ACTION");
     let _ = fs::remove_dir_all(&home);
 }
 
-fn assert_node_command_is_not_env_state(output: &std::process::Output) {
-    let combined = format!(
-        "{}{}",
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr)
-    );
-    assert!(
-        !combined.contains("未找到代理状态"),
-        "节点命令不得走 proxy.state: {combined}"
-    );
-    assert!(
-        !combined.contains("请先执行 `clash proxy start`")
-            && !combined.contains("请先执行 clash proxy start"),
-        "节点命令不得要求 proxy start: {combined}"
-    );
-}
-
 #[test]
-fn proxy_list_is_api_not_env_state() {
-    let home = temp_home("proxy_list_api");
+fn api_failure_is_network_error_and_keeps_canonical_action() {
+    let home = temp_home("api_failure");
     let output = run_with_home(
         &home,
         &[
-            "--json",
+            "--machine",
             "proxy",
             "list",
             "--controller",
@@ -506,306 +377,83 @@ fn proxy_list_is_api_not_env_state() {
             "1",
         ],
     );
-    assert_node_command_is_not_env_state(&output);
-    if !output.status.success() {
-        let value = assert_json_err(&output);
-        let err = value["error"].as_str().unwrap_or("");
-        assert!(
-            err.contains("controller")
-                || err.contains("连接")
-                || err.contains("请求")
-                || err.contains("配置")
-                || err.contains("失败"),
-            "失败应是 API/controller，不是 env 状态: {err}"
-        );
-    }
-    let alias = run_with_home(
-        &home,
-        &[
-            "--json",
-            "api",
-            "proxies",
-            "--controller",
-            "127.0.0.1:1",
-            "--timeout-secs",
-            "1",
-        ],
-    );
-    assert_node_command_is_not_env_state(&alias);
+    assert_machine_err(&output, "proxy.list", "NETWORK_ERROR");
     let _ = fs::remove_dir_all(&home);
 }
 
 #[test]
-fn proxy_switch_is_api_not_env_state() {
-    let home = temp_home("proxy_switch_api");
-    let output = run_with_home(
-        &home,
-        &[
-            "--json",
-            "proxy",
-            "switch",
-            "--group",
-            "Proxy",
-            "--proxy",
-            "direct",
-            "--controller",
-            "127.0.0.1:1",
-            "--timeout-secs",
-            "1",
-        ],
-    );
-    assert_node_command_is_not_env_state(&output);
-    if !output.status.success() {
-        let value = assert_json_err(&output);
-        let err = value["error"].as_str().unwrap_or("");
-        assert!(
-            !err.contains("未找到代理状态"),
-            "switch 失败不得来自 env writer: {err}"
-        );
-    }
+fn core_version_is_verified_read() {
+    let home = temp_home("core_version");
+    let output = run_with_home(&home, &["--machine", "core", "version"]);
+    let value = assert_machine_ok(&output, "core.version");
+    assert_eq!(value["data"]["installed"], false);
+    assert_eq!(value["effect"]["state_changed"], false);
+    assert_eq!(value["effect"]["verified"], true);
     let _ = fs::remove_dir_all(&home);
 }
 
 #[test]
-fn system_status_is_desktop_not_http() {
-    let home = temp_home("system_status_desktop");
-    let output = run_with_home(&home, &["--json", "system", "status"]);
-    assert!(
-        output.status.success(),
-        "system status 应成功: {}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-    let value = assert_json_ok(&output);
-    assert_eq!(value["action"], "proxy.system.status");
-    assert!(value.get("enabled").is_some());
-    let combined = format!(
-        "{}{}",
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr)
-    );
-    assert!(
-        !combined.contains("external-controller") && !combined.contains("/proxies"),
-        "system 不得走 mihomo HTTP: {combined}"
-    );
+fn contract_is_self_describing() {
+    let home = temp_home("contract_describe");
+    let output = run_with_home(&home, &["--machine", "contract"]);
+    let value = assert_machine_ok(&output, "contract.describe");
+    assert_eq!(value["data"]["version"], "clash.machine/v0");
+    let actions = value["data"]["actions"].as_array().unwrap();
+    assert!(actions.iter().any(|item| item["name"] == "sub.list"));
+    assert!(actions.iter().any(|item| item["name"] == "system.on"));
+    let human_only = value["data"]["human_only"].as_array().unwrap();
+    assert!(human_only.iter().any(|item| item == "setup.init"));
     let _ = fs::remove_dir_all(&home);
 }
 
 #[test]
-fn proxy_system_status_reports_backend_or_hint() {
-    let home = temp_home("sys_proxy");
-    let output = run_with_home(&home, &["proxy", "system", "status"]);
-    assert!(output.status.success());
-    let value = assert_json_ok(&output);
-    assert_eq!(value["action"], "proxy.system.status");
-    assert!(value.get("enabled").is_some());
+fn machine_mutation_requiring_target_rejects_implicit_active() {
+    let home = temp_home("explicit_target");
+    write_profile(&home, &fixture_text("subscription-no-tun.yaml"));
+    let output = run_with_home(&home, &["--machine", "sub", "render"]);
+    assert_machine_err(&output, "sub.render", "EXPLICIT_INPUT_REQUIRED");
+    assert!(!home.join("runtime/config.yaml").exists());
     let _ = fs::remove_dir_all(&home);
 }
 
 #[test]
-fn piped_ui_status_is_json_without_flag() {
-    let home = temp_home("ui_status");
-    let output = run_with_home(&home, &["ui", "status"]);
-    let value = assert_json_ok(&output);
-    assert_eq!(value["action"], "ui.status");
-    assert_eq!(value["installed"], false);
-    assert_eq!(value["name"], "metacubexd");
+fn hidden_human_proxy_state_commands_are_not_machine_capabilities() {
+    let home = temp_home("human_proxy_only");
+    let output = run_with_home(&home, &["--machine", "proxy", "status"]);
+    assert_machine_err(&output, "proxy.status", "UNSUPPORTED_MACHINE_ACTION");
     let _ = fs::remove_dir_all(&home);
 }
 
 #[test]
-fn piped_profile_list_is_json_without_json_flag() {
-    let home = temp_home("piped_list");
-    let output = run_with_home(&home, &["profile", "list"]);
-    let value = assert_json_ok(&output);
-    assert_eq!(value["action"], "profile.list");
+fn machine_env_on_requires_rendered_runtime_instead_of_guessing_ports() {
+    let home = temp_home("env_requires_runtime");
+    let output = run_with_home(&home, &["--machine", "env", "on"]);
+    let value = assert_machine_err(&output, "env.on", "RUNTIME_CONFIG_REQUIRED");
+    assert_eq!(value["effect"]["state_changed"], false);
     let _ = fs::remove_dir_all(&home);
 }
 
 #[test]
-fn text_flag_prints_human_profile_list() {
-    let home = temp_home("text_list");
-    let output = run_with_home(&home, &["--text", "profile", "list"]);
-    assert!(output.status.success());
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    assert!(
-        serde_json::from_str::<serde_json::Value>(stdout.trim()).is_err(),
-        " --text 不应输出 JSON: {stdout}"
-    );
-    assert!(
-        stdout.contains("暂无 profile") || stdout.contains("当前配置目录"),
-        "人读输出应说明当前状态: {stdout}"
-    );
+fn machine_proxy_list_requires_explicit_or_runtime_controller() {
+    let home = temp_home("controller_required");
+    let output = run_with_home(&home, &["--machine", "proxy", "list"]);
+    let value = assert_machine_err(&output, "proxy.list", "EXPLICIT_INPUT_REQUIRED");
+    assert_eq!(value["effect"]["state_changed"], false);
     let _ = fs::remove_dir_all(&home);
 }
 
 #[test]
-fn piped_proxy_env_stays_shell_script() {
-    let home = temp_home("piped_env");
-    let output = run_with_home(&home, &["proxy", "env", "off"]);
-    assert!(output.status.success());
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    assert!(stdout.contains("unset http_proxy"));
-    assert!(
-        serde_json::from_str::<serde_json::Value>(stdout.trim()).is_err(),
-        "proxy env 管道里仍应是 shell: {stdout}"
-    );
+fn machine_ui_url_requires_runtime_instead_of_guessing_9090() {
+    let home = temp_home("ui_url_runtime");
+    let output = run_with_home(&home, &["--machine", "ui", "url"]);
+    assert_machine_err(&output, "ui.url", "RUNTIME_CONFIG_REQUIRED");
     let _ = fs::remove_dir_all(&home);
 }
 
 #[test]
-fn piped_env_on_stays_shell_script() {
-    let home = temp_home("piped_env_top");
-    let start = run_with_home(
-        &home,
-        &[
-            "proxy",
-            "start",
-            "--host",
-            "127.0.0.1",
-            "--http-port",
-            "17890",
-            "--socks-port",
-            "17891",
-        ],
-    );
-    assert!(
-        start.status.success(),
-        "proxy start 别名应成功: {}",
-        String::from_utf8_lossy(&start.stderr)
-    );
-    let output = run_with_home(&home, &["env", "on"]);
-    assert!(output.status.success());
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    assert!(
-        stdout.contains("export http_proxy") || stdout.contains("http_proxy="),
-        "env on 应为 shell 导出脚本: {stdout}"
-    );
-    assert!(
-        serde_json::from_str::<serde_json::Value>(stdout.trim()).is_err(),
-        "env on 管道里仍应是 shell: {stdout}"
-    );
-    let _ = fs::remove_dir_all(&home);
-}
-
-#[test]
-fn sub_list_json_matches_profile_list() {
-    let home = temp_home("sub_list");
-    let profile = run_with_home(&home, &["--json", "profile", "list"]);
-    let sub = run_with_home(&home, &["--json", "sub", "list"]);
-    let profile_json = assert_json_ok(&profile);
-    let sub_json = assert_json_ok(&sub);
-    assert_eq!(profile_json["action"], "profile.list");
-    assert_eq!(sub_json["action"], profile_json["action"]);
-    assert_eq!(sub_json["profiles"], profile_json["profiles"]);
-    let _ = fs::remove_dir_all(&home);
-}
-
-#[test]
-fn verge_help_roles_and_aliases() {
-    let bin = common::binary_path();
-    let help = std::process::Command::new(bin)
-        .arg("--help")
-        .output()
-        .expect("help 失败");
-    assert!(help.status.success());
-    let top = String::from_utf8_lossy(&help.stdout);
-    for cmd in ["sub", "system", "mode", "env", "ui", "tun", "proxy"] {
-        assert!(top.contains(cmd), "顶层帮助缺少 {cmd}: {top}");
-    }
-    assert!(
-        top.contains("代理组") || top.contains("节点"),
-        "proxy 应为选节点/代理组: {top}"
-    );
-    assert!(
-        !top.contains("管理终端代理"),
-        "proxy 不应再写终端代理: {top}"
-    );
-
-    let proxy_help = std::process::Command::new(bin)
-        .args(["proxy", "--help"])
-        .output()
-        .expect("proxy help 失败");
-    let proxy_txt = String::from_utf8_lossy(&proxy_help.stdout);
-    assert!(
-        proxy_txt.contains("代理组") || proxy_txt.contains("节点"),
-        "proxy --help 应讲代理组/节点: {proxy_txt}"
-    );
-    assert!(
-        !proxy_txt.contains("终端代理环境变量"),
-        "proxy --help 不应是终端环境变量: {proxy_txt}"
-    );
-    assert!(
-        proxy_txt.contains("list") && proxy_txt.contains("switch"),
-        "proxy --help 应列出 list/switch: {proxy_txt}"
-    );
-
-    let system_help = std::process::Command::new(bin)
-        .args(["system", "--help"])
-        .output()
-        .expect("system help 失败");
-    let system_txt = String::from_utf8_lossy(&system_help.stdout);
-    assert!(
-        system_txt.contains("系统代理"),
-        "system --help 应描述系统代理: {system_txt}"
-    );
-
-    let env_help = std::process::Command::new(bin)
-        .args(["env", "--help"])
-        .output()
-        .expect("env help 失败");
-    let env_txt = String::from_utf8_lossy(&env_help.stdout);
-    assert!(
-        env_txt.contains("环境变量") || env_txt.contains("eval"),
-        "env --help 应描述复制环境变量: {env_txt}"
-    );
-
-    let sub_update = std::process::Command::new(bin)
-        .args(["sub", "update", "--help"])
-        .output()
-        .expect("sub update help 失败");
-    let sub_upd = String::from_utf8_lossy(&sub_update.stdout);
-    assert!(sub_upd.contains("fetch") || sub_upd.contains("拉取"));
-    assert!(sub_upd.contains("渲染") || sub_upd.contains("生效"));
-
-    let home = temp_home("alias_ok");
-    let profile_list = run_with_home(&home, &["--json", "profile", "list"]);
-    assert_json_ok(&profile_list);
-    let env_alias = run_with_home(&home, &["proxy", "env", "off"]);
-    assert!(env_alias.status.success());
-    let sys_alias = run_with_home(&home, &["proxy", "system", "status"]);
-    assert!(
-        sys_alias.status.success(),
-        "proxy system status 别名应成功: stdout={} stderr={}",
-        String::from_utf8_lossy(&sys_alias.stdout),
-        String::from_utf8_lossy(&sys_alias.stderr)
-    );
-    let _ = fs::remove_dir_all(&home);
-}
-
-#[test]
-fn json_env_enables_json_without_flag() {
-    let home = temp_home("json_env");
-    let output = std::process::Command::new(common::binary_path())
-        .args(["profile", "list"])
-        .env("CLASH_CLI_HOME", &home)
-        .env("CLASH_CLI_JSON", "true")
-        .env("CLASH_CLI_NO_AUTO_SUDO", "1")
-        .output()
-        .expect("执行失败");
-    let value = assert_json_ok(&output);
-    assert_eq!(value["action"], "profile.list");
-    let _ = fs::remove_dir_all(&home);
-}
-
-#[test]
-fn core_version_and_path_uninstalled_json() {
-    let home = temp_home("core_uninstalled");
-    let version = run_with_home(&home, &["--json", "core", "version"]);
-    let version_json = assert_json_ok(&version);
-    assert_eq!(version_json["installed"], false);
-
-    let path = run_with_home(&home, &["--json", "core", "path"]);
-    let path_json = assert_json_ok(&path);
-    assert_eq!(path_json["installed"], false);
+fn machine_validate_requires_explicit_subscription() {
+    let home = temp_home("validate_explicit");
+    let output = run_with_home(&home, &["--machine", "sub", "validate"]);
+    assert_machine_err(&output, "sub.validate", "EXPLICIT_INPUT_REQUIRED");
     let _ = fs::remove_dir_all(&home);
 }

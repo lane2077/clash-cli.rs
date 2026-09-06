@@ -3,7 +3,7 @@ use std::path::Path;
 
 use anyhow::{Result, bail};
 
-use crate::output::{is_json_mode, print_json};
+use crate::output::{is_machine_mode, print_machine};
 use crate::paths::app_paths;
 use crate::utils::command_exists;
 
@@ -33,7 +33,7 @@ pub(super) fn cmd_doctor() -> Result<()> {
     if ensure_tun_doctor_privileges_or_delegate()? == PrivilegeCheck::Delegated {
         return Ok(());
     }
-    if !is_json_mode() {
+    if !is_machine_mode() {
         println!("开始执行 tun 诊断...");
     }
 
@@ -56,13 +56,13 @@ pub(super) fn cmd_doctor() -> Result<()> {
         checks.push(check_from_note(note));
     }
 
-    let (pass_count, warn_count, fail_count) = if is_json_mode() {
+    let (pass_count, warn_count, fail_count) = if is_machine_mode() {
         summarize_checks(&checks)
     } else {
         print_checks(&checks)
     };
 
-    if is_json_mode() {
+    if is_machine_mode() {
         let list = checks
             .iter()
             .map(|item| {
@@ -74,9 +74,8 @@ pub(super) fn cmd_doctor() -> Result<()> {
                 })
             })
             .collect::<Vec<_>>();
-        return print_json(&serde_json::json!({
-            "ok": fail_count == 0,
-            "action": "tun.doctor",
+        return print_machine(&serde_json::json!({
+            "healthy": fail_count == 0,
             "summary": {
                 "pass": pass_count,
                 "warn": warn_count,

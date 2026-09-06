@@ -13,7 +13,8 @@ use crate::cli::{
     ProfileUpdateArgs, ProfileUseArgs, ProfileValidateArgs,
 };
 use crate::constants;
-use crate::output::{is_json_mode, print_json};
+use crate::machine::{ErrorCode, coded_error};
+use crate::output::{is_machine_mode, print_machine};
 use crate::paths::{AppPaths, app_paths};
 use crate::utils;
 
@@ -58,8 +59,8 @@ pub fn run(command: ProfileCommand) -> Result<()> {
         Ok(()) => Ok(()),
         Err(err) => {
             if should_retry_with_sudo(&retry_command, &err) {
-                if !is_json_mode() {
-                    println!("检测到权限不足，正在请求 sudo 授权继续执行 profile 命令...");
+                if !is_machine_mode() {
+                    println!("检测到权限不足，正在请求 sudo 授权继续执行 sub 命令...");
                 }
                 return run_profile_with_sudo(&retry_command);
             }
@@ -74,7 +75,10 @@ fn cmd_add(args: ProfileAddArgs) -> Result<()> {
     let mut index = load_index(&paths.profile_index_file)?;
 
     if index.profiles.iter().any(|p| p.name == args.name) {
-        bail!("profile 已存在: {}", args.name);
+        return Err(coded_error(
+            ErrorCode::ProfileAlreadyExists,
+            format!("订阅已存在: {}", args.name),
+        ));
     }
 
     let mut entry = ProfileEntry {
@@ -85,30 +89,23 @@ fn cmd_add(args: ProfileAddArgs) -> Result<()> {
         updated_at: None,
     };
 
-    if !args.no_fetch {
+    if args.fetch {
         fetch_profile_entry(&mut entry, &paths.profile_dir, true)?;
-    }
-    if args.use_profile {
-        index.active = Some(entry.name.clone());
     }
     index.profiles.push(entry.clone());
     save_index(&paths.profile_index_file, &index)?;
 
-    if is_json_mode() {
-        return print_json(&serde_json::json!({
-            "ok": true,
-            "action": "profile.add",
-            "profile": entry,
+    if is_machine_mode() {
+        return print_machine(&serde_json::json!({
+            "subscription": entry,
             "active": index.active,
+            "fetched": args.fetch,
         }));
     }
 
-    println!("已添加 profile: {}", args.name);
-    if !args.no_fetch {
+    println!("已添加订阅: {}", args.name);
+    if args.fetch {
         println!("已拉取订阅内容。");
-    }
-    if args.use_profile {
-        println!("已设为当前 profile。");
     }
     Ok(())
 }
@@ -117,19 +114,17 @@ fn cmd_list() -> Result<()> {
     let paths = app_paths()?;
     let index = load_index(&paths.profile_index_file)?;
 
-    if is_json_mode() {
-        return print_json(&serde_json::json!({
-            "ok": true,
-            "action": "profile.list",
+    if is_machine_mode() {
+        return print_machine(&serde_json::json!({
             "active": index.active,
-            "profiles": index.profiles
+            "subscriptions": index.profiles
         }));
     }
 
     if index.profiles.is_empty() {
         print_profile_home_hint(&paths);
-        println!("暂无 profile。可执行 `clash profile add --name xxx --url ...`");
-        println!("已有订阅后更新并生效: clash profile update");
+        println!("暂无订阅。可执行 `clash sub add --name xxx --url ...`");
+        println!("已有订阅后更新并生效: clash sub update");
         return Ok(());
     }
 
@@ -156,59 +151,54 @@ fn cmd_list() -> Result<()> {
 
 fn cmd_use(args: ProfileUseArgs) -> Result<()> {
     let paths = app_paths()?;
-    let apply = args.apply || args.fetch;
-
-    let mut index = load_index(&paths.profile_index_file)?;
-
-    if !index.profiles.iter().any(|p| p.name == args.name) {
-        bail!("profile 不存在: {}", args.name);
+    let index = load_index(&paths.profile_index_file)?;
+    let selected = index
+        .profiles
+        .iter()
+        .find(|profile| profile.name == args.name)
+        .ok_or_else(|| {
+            coded_error(
+                ErrorCode::ProfileNotFound,
+                format!("订阅不存在: {}", args.name),
+            )
+        })?;
+    let selected_path = paths.profile_dir.join(&selected.file);
+    if !selected_path.is_file() {
+        return Err(coded_error(
+            ErrorCode::ProfileNotReady,
+            format!(
+                "订阅 `{}` 尚未拉取；请先执行 `clash sub fetch --name {}`",
+                args.name, args.name
+            ),
+        ));
     }
 
-    if apply {
-        // 先完成 fetch/render，成功后再提交 active，避免失败切换留下半状态。
-        apply_subscription(
-            &paths,
-            ApplySpec {
-                name: Some(args.name.clone()),
-                fetch: args.fetch,
-                render: true,
-                restart: !args.no_restart,
-                service_name: args.service_name.clone(),
-            },
-        )?;
-        index = load_index(&paths.profile_index_file)?;
-    } else {
-        index.active = Some(args.name.clone());
-        save_index(&paths.profile_index_file, &index)?;
-    }
+    let applied = apply_subscription(
+        &paths,
+        ApplySpec {
+            name: Some(args.name.clone()),
+            fetch: false,
+            render: true,
+            restart: !args.no_restart,
+            service_name: args.service_name.clone(),
+        },
+    )?;
 
-    if is_json_mode() {
-        return print_json(&serde_json::json!({
-            "ok": true,
-            "action": "profile.use",
-            "active": index.active,
-            "applied": apply,
-            "fetched": args.fetch,
-            "restarted": apply && !args.no_restart,
+    if is_machine_mode() {
+        return print_machine(&serde_json::json!({
+            "active": applied.name,
+            "restarted": applied.restarted,
             "service": utils::normalize_unit_name(&args.service_name),
         }));
     }
 
-    println!("当前 profile 已切换为: {}", args.name);
-    if apply {
-        println!("已渲染到运行配置。");
-        if args.no_restart {
-            println!("已跳过服务重启（--no-restart）。");
-        } else {
-            println!(
-                "已重启服务: {}",
-                utils::normalize_unit_name(&args.service_name)
-            );
-        }
+    println!("当前运行订阅已切换为: {}", args.name);
+    if args.no_restart {
+        println!("已跳过服务重启（--no-restart）。");
     } else {
         println!(
-            "提示: 仅切换了 active profile；更新并生效: clash profile update --name {}",
-            args.name
+            "已重启服务: {}",
+            utils::normalize_unit_name(&args.service_name)
         );
     }
     Ok(())
@@ -229,11 +219,9 @@ fn cmd_update(args: ProfileUpdateArgs) -> Result<()> {
     let name = applied.name;
     let restarted = applied.restarted;
 
-    if is_json_mode() {
-        return print_json(&serde_json::json!({
-            "ok": true,
-            "action": "profile.update",
-            "profile": name,
+    if is_machine_mode() {
+        return print_machine(&serde_json::json!({
+            "subscription": name,
             "fetched": true,
             "applied": true,
             "restarted": restarted,
@@ -260,27 +248,23 @@ struct FetchOutcome {
 
 fn cmd_fetch(args: ProfileFetchArgs) -> Result<()> {
     let outcome = fetch_profile_named(&args.name, args.force)?;
-    if is_json_mode() {
+    if is_machine_mode() {
         if outcome.skipped {
-            return print_json(&serde_json::json!({
-                "ok": true,
-                "action": "profile.fetch",
+            return print_machine(&serde_json::json!({
                 "name": args.name,
                 "skipped": true,
                 "reason": "recently updated",
             }));
         }
-        return print_json(&serde_json::json!({
-            "ok": true,
-            "action": "profile.fetch",
-            "profile": outcome.profile,
+        return print_machine(&serde_json::json!({
+            "subscription": outcome.profile,
         }));
     }
 
     if outcome.skipped {
         println!("最近 60 秒内已更新，跳过拉取。可加 --force 强制更新。");
     } else {
-        println!("profile 拉取成功: {}", args.name);
+        println!("订阅拉取成功: {}", args.name);
     }
     Ok(())
 }
@@ -296,7 +280,9 @@ fn fetch_profile_in(paths: &AppPaths, name: &str, force: bool) -> Result<FetchOu
             .profiles
             .iter_mut()
             .find(|p| p.name == name)
-            .context("profile 不存在")?;
+            .ok_or_else(|| {
+                coded_error(ErrorCode::ProfileNotFound, format!("订阅不存在: {name}"))
+            })?;
 
         let profile_path = paths.profile_dir.join(&profile.file);
         if !force
@@ -325,15 +311,27 @@ fn cmd_remove(args: ProfileRemoveArgs) -> Result<()> {
     let paths = app_paths()?;
     let mut index = load_index(&paths.profile_index_file)?;
 
+    if index.active.as_deref() == Some(args.name.as_str()) {
+        return Err(coded_error(
+            ErrorCode::StateConflict,
+            format!(
+                "不能删除当前运行订阅 `{}`；请先 render 另一订阅，使 active/runtime 一起切换",
+                args.name
+            ),
+        ));
+    }
+
     let pos = index
         .profiles
         .iter()
         .position(|p| p.name == args.name)
-        .context("profile 不存在")?;
+        .ok_or_else(|| {
+            coded_error(
+                ErrorCode::ProfileNotFound,
+                format!("订阅不存在: {}", args.name),
+            )
+        })?;
     let removed = index.profiles.remove(pos);
-    if index.active.as_deref() == Some(removed.name.as_str()) {
-        index.active = None;
-    }
     save_index(&paths.profile_index_file, &index)?;
 
     let profile_path = paths.profile_dir.join(removed.file);
@@ -347,16 +345,14 @@ fn cmd_remove(args: ProfileRemoveArgs) -> Result<()> {
             .with_context(|| format!("删除 profile 文件失败: {}", profile_path.display()))?;
     }
 
-    if is_json_mode() {
-        return print_json(&serde_json::json!({
-            "ok": true,
-            "action": "profile.remove",
+    if is_machine_mode() {
+        return print_machine(&serde_json::json!({
             "removed": args.name,
             "active": index.active,
         }));
     }
 
-    println!("已删除 profile: {}", args.name);
+    println!("已删除订阅: {}", args.name);
     Ok(())
 }
 
@@ -366,12 +362,17 @@ struct RenderOutcome {
 }
 
 fn cmd_render(args: ProfileRenderArgs) -> Result<()> {
+    let commit_active = args.output.is_none();
     let outcome = render_profile_to_runtime(&args)?;
-    if is_json_mode() {
-        return print_json(&serde_json::json!({
-            "ok": true,
-            "action": "profile.render",
-            "profile": outcome.profile,
+    if commit_active {
+        let paths = app_paths()?;
+        let mut index = load_index(&paths.profile_index_file)?;
+        index.active = Some(outcome.profile.clone());
+        save_index(&paths.profile_index_file, &index)?;
+    }
+    if is_machine_mode() {
+        return print_machine(&serde_json::json!({
+            "subscription": outcome.profile,
             "output": outcome.output.display().to_string(),
             "follow_subscription_port": args.follow_subscription_port,
         }));
@@ -401,11 +402,13 @@ fn render_profile_in(paths: &AppPaths, args: &ProfileRenderArgs) -> Result<Rende
     let selected = select_profile(&index, args.name.as_deref())?;
     let source_path = paths.profile_dir.join(&selected.file);
     if !source_path.exists() {
-        bail!(
-            "profile 文件不存在: {}，请先执行 `clash profile fetch --name {}`",
-            source_path.display(),
-            selected.name
-        );
+        return Err(coded_error(
+            ErrorCode::ProfileNotReady,
+            format!(
+                "订阅 `{}` 尚未拉取；请先执行 `clash sub fetch --name {}`",
+                selected.name, selected.name
+            ),
+        ));
     }
 
     let root = load_yaml(&source_path)?;
@@ -434,11 +437,13 @@ fn cmd_validate(args: ProfileValidateArgs) -> Result<()> {
     let selected = select_profile(&index, args.name.as_deref())?;
     let source_path = paths.profile_dir.join(&selected.file);
     if !source_path.exists() {
-        bail!(
-            "profile 文件不存在: {}，请先执行 `clash profile fetch --name {}`",
-            source_path.display(),
-            selected.name
-        );
+        return Err(coded_error(
+            ErrorCode::ProfileNotReady,
+            format!(
+                "订阅 `{}` 尚未拉取；请先执行 `clash sub fetch --name {}`",
+                selected.name, selected.name
+            ),
+        ));
     }
 
     let root = load_yaml(&source_path)?;
@@ -453,19 +458,17 @@ fn cmd_validate(args: ProfileValidateArgs) -> Result<()> {
         warnings.push("未检测到 rules".to_string());
     }
 
-    if is_json_mode() {
-        return print_json(&serde_json::json!({
-            "ok": true,
-            "action": "profile.validate",
-            "profile": selected.name,
+    if is_machine_mode() {
+        return print_machine(&serde_json::json!({
+            "subscription": selected.name,
             "warnings": warnings,
         }));
     }
 
     if warnings.is_empty() {
-        println!("profile 校验通过: {}", selected.name);
+        println!("订阅校验通过: {}", selected.name);
     } else {
-        println!("profile 校验完成: {}", selected.name);
+        println!("订阅校验完成: {}", selected.name);
         for item in warnings {
             println!("- {}", item);
         }
@@ -475,14 +478,20 @@ fn cmd_validate(args: ProfileValidateArgs) -> Result<()> {
 
 fn validate_profile_name(name: &str) -> Result<()> {
     if name.trim().is_empty() {
-        bail!("profile 名称不能为空");
+        return Err(coded_error(ErrorCode::ProfileInvalid, "订阅名称不能为空"));
     }
     if name.eq_ignore_ascii_case("mixin") {
-        bail!("profile 名称 `mixin` 为保留名称，请换一个名称");
+        return Err(coded_error(
+            ErrorCode::ProfileInvalid,
+            "订阅名称 `mixin` 为保留名称，请换一个名称",
+        ));
     }
     for c in name.chars() {
         if !(c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.') {
-            bail!("profile 名称仅支持字母/数字/.-_");
+            return Err(coded_error(
+                ErrorCode::ProfileInvalid,
+                "订阅名称仅支持字母/数字/.-_",
+            ));
         }
     }
     Ok(())
@@ -493,14 +502,19 @@ pub(crate) fn load_index(path: &Path) -> Result<ProfileIndex> {
         return Ok(ProfileIndex::default());
     }
     let content = fs::read_to_string(path)
-        .with_context(|| format!("读取 profile 索引失败: {}", path.display()))?;
-    serde_json::from_str(&content).context("解析 profile 索引失败")
+        .with_context(|| format!("读取订阅索引失败: {}", path.display()))?;
+    serde_json::from_str(&content).map_err(|err| {
+        coded_error(
+            ErrorCode::ConfigInvalid,
+            format!("解析订阅索引失败 {}: {err}", path.display()),
+        )
+    })
 }
 
 pub(crate) fn save_index(path: &Path, index: &ProfileIndex) -> Result<()> {
-    let content = serde_json::to_string_pretty(index).context("序列化 profile 索引失败")?;
+    let content = serde_json::to_string_pretty(index).context("序列化 订阅索引失败")?;
     utils::write_atomic_text(path, &content)
-        .with_context(|| format!("写入 profile 索引失败: {}", path.display()))
+        .with_context(|| format!("写入 订阅索引失败: {}", path.display()))
 }
 
 fn local_subscription_path(url: &str) -> Option<PathBuf> {
@@ -517,7 +531,10 @@ fn local_subscription_path(url: &str) -> Option<PathBuf> {
 
 fn fetch_profile_entry(entry: &mut ProfileEntry, profile_dir: &Path, _force: bool) -> Result<()> {
     if entry.file.eq_ignore_ascii_case("mixin.yaml") {
-        bail!("检测到旧版保留名称 profile `mixin`；为避免覆盖本地 mixin，请先改名后再拉取");
+        return Err(coded_error(
+            ErrorCode::ProfileInvalid,
+            "检测到保留名称订阅 `mixin`；为避免覆盖本地 mixin，请先改名后再拉取",
+        ));
     }
     fs::create_dir_all(profile_dir)
         .with_context(|| format!("创建目录失败: {}", profile_dir.display()))?;
@@ -541,7 +558,12 @@ fn fetch_profile_entry(entry: &mut ProfileEntry, profile_dir: &Path, _force: boo
 
         response.text().context("读取订阅响应失败")?
     };
-    let root: Value = serde_yaml::from_str(&body).context("订阅内容不是有效 YAML")?;
+    let root: Value = serde_yaml::from_str(&body).map_err(|err| {
+        coded_error(
+            ErrorCode::ProfileInvalid,
+            format!("订阅内容不是有效 YAML: {err}"),
+        )
+    })?;
     validate_subscription_root(&root)?;
 
     let path = profile_dir.join(&entry.file);
@@ -552,14 +574,20 @@ fn fetch_profile_entry(entry: &mut ProfileEntry, profile_dir: &Path, _force: boo
 }
 
 fn validate_subscription_root(root: &Value) -> Result<()> {
-    let mapping = root
-        .as_mapping()
-        .context("订阅顶层必须是 YAML 对象，拒绝覆盖现有配置")?;
+    let Some(mapping) = root.as_mapping() else {
+        return Err(coded_error(
+            ErrorCode::ProfileInvalid,
+            "订阅顶层必须是 YAML 对象，拒绝覆盖现有配置",
+        ));
+    };
     let has_proxy_source = ["proxies", "proxy-providers"]
         .iter()
         .any(|key| mapping.contains_key(Value::String((*key).to_string())));
     if !has_proxy_source {
-        bail!("订阅缺少 proxies/proxy-providers，拒绝覆盖现有配置");
+        return Err(coded_error(
+            ErrorCode::ProfileInvalid,
+            "订阅缺少 proxies/proxy-providers，拒绝覆盖现有配置",
+        ));
     }
     Ok(())
 }
@@ -571,19 +599,24 @@ fn select_profile<'a>(index: &'a ProfileIndex, name: Option<&str>) -> Result<&'a
         index
             .active
             .clone()
-            .context("未指定 profile 且当前没有 active profile")?
+            .context("未指定订阅且当前没有 active 订阅")?
     };
     index
         .profiles
         .iter()
         .find(|p| p.name == target)
-        .with_context(|| format!("profile 不存在: {}", target))
+        .ok_or_else(|| coded_error(ErrorCode::ProfileNotFound, format!("订阅不存在: {target}")))
 }
 
 fn load_yaml(path: &Path) -> Result<Value> {
     let content =
         fs::read_to_string(path).with_context(|| format!("读取 YAML 失败: {}", path.display()))?;
-    serde_yaml::from_str(&content).with_context(|| format!("解析 YAML 失败: {}", path.display()))
+    serde_yaml::from_str(&content).map_err(|err| {
+        coded_error(
+            ErrorCode::ConfigInvalid,
+            format!("解析 YAML 失败 {}: {err}", path.display()),
+        )
+    })
 }
 
 fn load_runtime_or_empty(path: &Path) -> Result<Value> {
@@ -605,7 +638,7 @@ fn write_yaml_file(path: &Path, root: &Value) -> Result<()> {
 }
 
 /// 订阅生效：拉取、合成 runtime、重启服务。
-/// `sub use --apply` 与 `sub update` 穿过同一 seam，不在命令里各拼一遍流水线。
+/// `sub use` 与 `sub update` 穿过同一生效 seam，不在命令里各拼一遍流水线。
 #[derive(Debug, Clone)]
 pub struct ApplySpec {
     pub name: Option<String>,
@@ -692,7 +725,7 @@ pub fn merge_subscription_overlay(
     root
 }
 
-/// 将当前 active profile（若有）与 mixin 合成为 runtime/config.yaml。
+/// 将当前 active 订阅（若有）与 mixin 合成为 runtime/config.yaml。
 pub fn render_runtime_from_home(paths: &AppPaths) -> Result<()> {
     let mixin = if paths.profile_mixin_file.exists() {
         Some(load_yaml(&paths.profile_mixin_file)?)
@@ -812,7 +845,7 @@ fn ensure_service_runtime_home_matches_current(
 
     if let Some(home) = service_home {
         message.push_str(&format!(
-            "\n请改用同一目录执行，例如:\n  sudo env CLASH_CLI_HOME={} clash profile use --name <profile> --fetch --apply --service-name {}",
+            "\n请改用同一目录执行，例如:\n  sudo env CLASH_CLI_HOME={} clash sub update --name <name> --service-name {}",
             home.display(),
             trim_service_suffix(service_name)
         ));
@@ -827,7 +860,10 @@ fn ensure_service_runtime_home_matches_current(
         );
     }
 
-    bail!("配置目录不一致，已阻止继续执行。\n{message}");
+    Err(coded_error(
+        ErrorCode::StateConflict,
+        format!("配置目录不一致，已阻止继续执行。\n{message}"),
+    ))
 }
 
 fn detect_service_runtime_config_path(unit: &str) -> Result<Option<PathBuf>> {
@@ -919,7 +955,7 @@ fn trim_service_suffix(name: &str) -> &str {
 }
 
 fn print_profile_home_hint(paths: &AppPaths) {
-    if is_json_mode() {
+    if is_machine_mode() {
         return;
     }
     println!("当前配置目录: {}", paths.config_dir.display());
@@ -934,7 +970,7 @@ fn print_profile_home_hint(paths: &AppPaths) {
         );
         if let Some(home) = infer_home_from_runtime_config(&service_runtime_config) {
             println!(
-                "如需管理该服务，请使用: sudo env CLASH_CLI_HOME={} clash profile list",
+                "如需管理该服务，请使用: sudo env CLASH_CLI_HOME={} clash sub list",
                 home.display()
             );
         }
@@ -948,7 +984,7 @@ fn should_retry_with_sudo(command: &ProfileCommand, err: &anyhow::Error) -> bool
     if !auto_sudo::is_permission_denied_error(err) {
         return false;
     }
-    auto_sudo::should_auto_delegate(is_json_mode())
+    auto_sudo::should_auto_delegate(is_machine_mode())
 }
 
 fn profile_command_requires_write(command: &ProfileCommand) -> bool {
@@ -965,7 +1001,7 @@ fn profile_command_requires_write(command: &ProfileCommand) -> bool {
 
 fn run_profile_with_sudo(command: &ProfileCommand) -> Result<()> {
     let cli_args = profile_command_to_cli_args(command)?;
-    let status = auto_sudo::run_with_sudo(is_json_mode(), |cmd| {
+    let status = auto_sudo::run_with_sudo(is_machine_mode(), |cmd| {
         cmd.args(&cli_args);
         Ok(())
     })?;
@@ -976,7 +1012,7 @@ fn run_profile_with_sudo(command: &ProfileCommand) -> Result<()> {
 }
 
 fn profile_command_to_cli_args(command: &ProfileCommand) -> Result<Vec<String>> {
-    let mut args = vec!["profile".to_string()];
+    let mut args = vec!["sub".to_string()];
     match command {
         ProfileCommand::Add(v) => {
             args.push("add".to_string());
@@ -984,11 +1020,8 @@ fn profile_command_to_cli_args(command: &ProfileCommand) -> Result<Vec<String>> 
             args.push(v.name.clone());
             args.push("--url".to_string());
             args.push(v.url.clone());
-            if v.use_profile {
-                args.push("--use-profile".to_string());
-            }
-            if v.no_fetch {
-                args.push("--no-fetch".to_string());
+            if v.fetch {
+                args.push("--fetch".to_string());
             }
         }
         ProfileCommand::List => {
@@ -998,12 +1031,6 @@ fn profile_command_to_cli_args(command: &ProfileCommand) -> Result<Vec<String>> 
             args.push("use".to_string());
             args.push("--name".to_string());
             args.push(v.name.clone());
-            if v.apply {
-                args.push("--apply".to_string());
-            }
-            if v.fetch {
-                args.push("--fetch".to_string());
-            }
             args.push("--service-name".to_string());
             args.push(v.service_name.clone());
             if v.no_restart {

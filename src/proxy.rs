@@ -13,7 +13,8 @@ use crate::cli::{
     AutoAction, EnvAction, ProxyCommand, ShellKind, StartArgs, StopArgs, SystemProxyAction,
 };
 use crate::constants;
-use crate::output::{is_json_mode, print_json};
+use crate::machine::{ErrorCode, coded_error};
+use crate::output::{is_machine_mode, print_machine};
 use crate::paths::app_paths;
 use crate::utils;
 
@@ -106,10 +107,16 @@ pub fn run(command: ProxyCommand) -> Result<()> {
         ProxyCommand::Start(args) => cmd_start(args),
         ProxyCommand::Stop(args) => cmd_stop(args),
         ProxyCommand::Status => cmd_status(),
-        ProxyCommand::Env { action } => cmd_env(action),
         ProxyCommand::Auto { action } => cmd_auto(action),
-        ProxyCommand::System { action } => cmd_system(action),
     }
+}
+
+pub fn run_env(action: EnvAction) -> Result<()> {
+    cmd_env(action)
+}
+
+pub fn run_system(action: SystemProxyAction) -> Result<()> {
+    cmd_system(action)
 }
 
 fn cmd_start(args: StartArgs) -> Result<()> {
@@ -131,10 +138,8 @@ fn cmd_start(args: StartArgs) -> Result<()> {
     }
 
     let export_script = state.export_script();
-    if is_json_mode() {
-        return print_json(&serde_json::json!({
-            "ok": true,
-            "action": "proxy.start",
+    if is_machine_mode() {
+        return print_machine(&serde_json::json!({
             "state": state,
             "auto": args.auto,
             "auto_shell": auto_shell.map(|v| v.as_str().to_string()),
@@ -194,7 +199,7 @@ fn load_runtime_proxy_defaults(path: &Path) -> RuntimeProxyDefaults {
     match try_load_runtime_proxy_defaults(path) {
         Ok(v) => v,
         Err(err) => {
-            if !is_json_mode() {
+            if !is_machine_mode() {
                 eprintln!("警告: 读取 runtime 配置失败，将回退默认代理端口: {}", err);
             }
             RuntimeProxyDefaults::default()
@@ -274,10 +279,8 @@ fn cmd_stop(args: StopArgs) -> Result<()> {
     }
 
     let script = unset_script();
-    if is_json_mode() {
-        return print_json(&serde_json::json!({
-            "ok": true,
-            "action": "proxy.stop",
+    if is_machine_mode() {
+        return print_machine(&serde_json::json!({
             "auto_off": args.auto_off,
             "auto_shell": auto_shell.map(|v| v.as_str().to_string()),
             "script": if args.print_env { Some(script) } else { None },
@@ -302,10 +305,8 @@ fn cmd_stop(args: StopArgs) -> Result<()> {
 fn cmd_status() -> Result<()> {
     let paths = app_paths()?;
     if !paths.state_file.exists() {
-        if is_json_mode() {
-            return print_json(&serde_json::json!({
-                "ok": true,
-                "action": "proxy.status",
+        if is_machine_mode() {
+            return print_machine(&serde_json::json!({
                 "configured": false,
                 "hint": "先执行 `clash proxy start`"
             }));
@@ -318,10 +319,8 @@ fn cmd_status() -> Result<()> {
     let state = load_state(&paths.state_file)?;
     let zsh_auto = shell_hook_installed(ShellKind::Zsh)?;
     let bash_auto = shell_hook_installed(ShellKind::Bash)?;
-    if is_json_mode() {
-        return print_json(&serde_json::json!({
-            "ok": true,
-            "action": "proxy.status",
+    if is_machine_mode() {
+        return print_machine(&serde_json::json!({
             "configured": true,
             "state": state,
             "auto": {
@@ -337,7 +336,7 @@ fn cmd_status() -> Result<()> {
     println!("SOCKS5: socks5://{}:{}", state.host, state.socks_port);
     println!("NO_PROXY: {}", state.no_proxy);
     println!("当前终端生效命令: eval \"$(clash env on)\"");
-    println!("桌面系统代理: clash proxy system on   （与 tun 分开）");
+    println!("桌面系统代理: clash system on   （与 tun 分开）");
 
     println!("自动启用(zsh): {}", if zsh_auto { "开启" } else { "关闭" });
     println!(
@@ -351,13 +350,10 @@ fn cmd_status() -> Result<()> {
 fn cmd_env(action: EnvAction) -> Result<()> {
     match action {
         EnvAction::On => {
-            let paths = app_paths()?;
-            let state = load_state(&paths.state_file)?;
+            let state = current_proxy_state()?;
             let script = state.export_script();
-            if is_json_mode() {
-                return print_json(&serde_json::json!({
-                    "ok": true,
-                    "action": "proxy.env.on",
+            if is_machine_mode() {
+                return print_machine(&serde_json::json!({
                     "script": script
                 }));
             }
@@ -365,10 +361,8 @@ fn cmd_env(action: EnvAction) -> Result<()> {
         }
         EnvAction::Off => {
             let script = unset_script();
-            if is_json_mode() {
-                return print_json(&serde_json::json!({
-                    "ok": true,
-                    "action": "proxy.env.off",
+            if is_machine_mode() {
+                return print_machine(&serde_json::json!({
                     "script": script
                 }));
             }
@@ -383,10 +377,8 @@ fn cmd_auto(action: AutoAction) -> Result<()> {
         AutoAction::On { .. } => {
             let shell = action.shell().unwrap_or(detect_shell()?);
             install_shell_hook(shell)?;
-            if is_json_mode() {
-                return print_json(&serde_json::json!({
-                    "ok": true,
-                    "action": "proxy.auto.on",
+            if is_machine_mode() {
+                return print_machine(&serde_json::json!({
                     "shell": shell.as_str(),
                     "enabled": true
                 }));
@@ -396,10 +388,8 @@ fn cmd_auto(action: AutoAction) -> Result<()> {
         AutoAction::Off { .. } => {
             let shell = action.shell().unwrap_or(detect_shell()?);
             uninstall_shell_hook(shell)?;
-            if is_json_mode() {
-                return print_json(&serde_json::json!({
-                    "ok": true,
-                    "action": "proxy.auto.off",
+            if is_machine_mode() {
+                return print_machine(&serde_json::json!({
                     "shell": shell.as_str(),
                     "enabled": false
                 }));
@@ -409,10 +399,8 @@ fn cmd_auto(action: AutoAction) -> Result<()> {
         AutoAction::Status { .. } => {
             if let Some(shell) = action.shell() {
                 let enabled = shell_hook_installed(shell)?;
-                if is_json_mode() {
-                    return print_json(&serde_json::json!({
-                        "ok": true,
-                        "action": "proxy.auto.status",
+                if is_machine_mode() {
+                    return print_machine(&serde_json::json!({
                         "shells": {
                             shell.as_str(): enabled
                         }
@@ -427,10 +415,8 @@ fn cmd_auto(action: AutoAction) -> Result<()> {
                 let zsh = shell_hook_installed(ShellKind::Zsh)?;
                 let bash = shell_hook_installed(ShellKind::Bash)?;
                 let fish = shell_hook_installed(ShellKind::Fish)?;
-                if is_json_mode() {
-                    return print_json(&serde_json::json!({
-                        "ok": true,
-                        "action": "proxy.auto.status",
+                if is_machine_mode() {
+                    return print_machine(&serde_json::json!({
                         "shells": {
                             "zsh": zsh,
                             "bash": bash,
@@ -471,8 +457,53 @@ fn system_proxy_state_path() -> Result<std::path::PathBuf> {
     Ok(app_paths()?.config_dir.join("system-proxy.state"))
 }
 
+fn machine_proxy_state_from_runtime(path: &Path) -> Result<ProxyState> {
+    if !path.is_file() {
+        return Err(coded_error(
+            ErrorCode::RuntimeConfigRequired,
+            format!(
+                "机器动作需要已渲染 runtime 配置: {}；请先执行 `clash --machine sub render --name <name>`",
+                path.display()
+            ),
+        ));
+    }
+    let runtime = try_load_runtime_proxy_defaults(path).map_err(|err| {
+        coded_error(
+            ErrorCode::ConfigInvalid,
+            format!("读取 runtime 代理配置失败: {err}"),
+        )
+    })?;
+    let host = runtime.host.ok_or_else(|| {
+        coded_error(
+            ErrorCode::ConfigInvalid,
+            "runtime 缺少可用 bind-address，拒绝猜测代理地址",
+        )
+    })?;
+    let http_port = runtime.mixed_port.or(runtime.http_port).ok_or_else(|| {
+        coded_error(
+            ErrorCode::ConfigInvalid,
+            "runtime 缺少 mixed-port/port，拒绝猜测 HTTP 代理端口",
+        )
+    })?;
+    let socks_port = runtime.socks_port.or(runtime.mixed_port).ok_or_else(|| {
+        coded_error(
+            ErrorCode::ConfigInvalid,
+            "runtime 缺少 socks-port/mixed-port，拒绝猜测 SOCKS 代理端口",
+        )
+    })?;
+    Ok(ProxyState {
+        host,
+        http_port,
+        socks_port,
+        no_proxy: constants::DEFAULT_NO_PROXY.to_string(),
+    })
+}
+
 fn current_proxy_state() -> Result<ProxyState> {
     let paths = app_paths()?;
+    if is_machine_mode() {
+        return machine_proxy_state_from_runtime(&paths.runtime_config_file);
+    }
     if paths.state_file.exists() {
         return load_state(&paths.state_file);
     }
@@ -506,8 +537,8 @@ fn cmd_system_on() -> Result<()> {
         run_sys_cmd, snapshot_macos_services, unsupported_hint, write_record,
     };
 
-    let backend = detect_backend().ok_or_else(|| anyhow::anyhow!(unsupported_hint()))?;
     let proxy = current_proxy_state()?;
+    let backend = detect_backend().ok_or_else(|| anyhow::anyhow!(unsupported_hint()))?;
     let host = loopback_host(&proxy.host);
     let path = system_proxy_state_path()?;
     let existing = read_record(&path)?;
@@ -545,9 +576,10 @@ fn cmd_system_on() -> Result<()> {
             if existing.as_ref().is_some_and(|record| {
                 record.enabled && record.backend == backend && record.previous_macos.is_empty()
             }) {
-                bail!(
-                    "检测到旧版 macOS 系统代理状态，缺少原始代理快照。请先执行 `clash system off` 清理旧接管，再执行 `clash system on` 建立可恢复快照"
-                );
+                return Err(coded_error(
+                    ErrorCode::StateConflict,
+                    "检测到无法恢复的 macOS 系统代理状态；请先执行 `clash system off` 清理旧接管，再执行 `clash system on` 建立可恢复快照",
+                ));
             }
             let previous_macos = existing
                 .as_ref()
@@ -579,10 +611,8 @@ fn cmd_system_on() -> Result<()> {
         }
     }
 
-    if is_json_mode() {
-        return print_json(&serde_json::json!({
-            "ok": true,
-            "action": "proxy.system.on",
+    if is_machine_mode() {
+        return print_machine(&serde_json::json!({
             "backend": format!("{:?}", backend).to_lowercase(),
             "host": host,
             "http_port": proxy.http_port,
@@ -593,7 +623,7 @@ fn cmd_system_on() -> Result<()> {
         "已开启系统代理: http://{}:{}  socks5://{}:{}",
         host, proxy.http_port, host, proxy.socks_port
     );
-    println!("关闭: clash proxy system off");
+    println!("关闭: clash system off");
     println!("全局接管（含不走系统代理的程序）: clash tun on");
     Ok(())
 }
@@ -608,10 +638,8 @@ fn cmd_system_off() -> Result<()> {
     let record = read_record(&path)?;
     let Some(record) = record else {
         // 没有本工具的接管记录时绝不修改系统现有代理。
-        if is_json_mode() {
-            return print_json(&serde_json::json!({
-                "ok": true,
-                "action": "proxy.system.off",
+        if is_machine_mode() {
+            return print_machine(&serde_json::json!({
                 "changed": false,
                 "reason": "not managed by clash-cli"
             }));
@@ -642,10 +670,8 @@ fn cmd_system_off() -> Result<()> {
     }
     clear_record(&path)?;
 
-    if is_json_mode() {
-        return print_json(&serde_json::json!({
-            "ok": true,
-            "action": "proxy.system.off",
+    if is_machine_mode() {
+        return print_machine(&serde_json::json!({
             "backend": format!("{:?}", backend).to_lowercase(),
         }));
     }
@@ -654,20 +680,26 @@ fn cmd_system_off() -> Result<()> {
 }
 
 fn cmd_system_status() -> Result<()> {
-    use crate::system_proxy::{detect_backend, read_record};
+    use crate::system_proxy::{detect_backend, observe_record_matches, read_record};
 
     let path = system_proxy_state_path()?;
     let record = read_record(&path)?;
     let backend = detect_backend();
-    let enabled = record.as_ref().map(|r| r.enabled).unwrap_or(false);
+    let managed = record.as_ref().map(|r| r.enabled).unwrap_or(false);
+    let observed_matches = record
+        .as_ref()
+        .and_then(|record| observe_record_matches(record).ok().flatten());
 
-    if is_json_mode() {
-        return print_json(&serde_json::json!({
-            "ok": true,
-            "action": "proxy.system.status",
+    if is_machine_mode() {
+        return print_machine(&serde_json::json!({
             "backend": backend.map(|b| format!("{:?}", b).to_lowercase()),
-            "enabled": enabled,
-            "record": record,
+            "committed": {
+                "managed": managed,
+                "record": record,
+            },
+            "observed": {
+                "matches_committed": observed_matches,
+            },
         }));
     }
 
@@ -679,7 +711,10 @@ fn cmd_system_status() -> Result<()> {
             return Ok(());
         }
     }
-    if enabled {
+    if managed {
+        if observed_matches == Some(false) {
+            println!("警告: clash-cli 有接管记录，但当前系统代理已与记录不一致。");
+        }
         if let Some(r) = record {
             println!(
                 "系统代理: 已开启  http://{}:{}  socks5://{}:{}",
@@ -690,7 +725,7 @@ fn cmd_system_status() -> Result<()> {
         }
     } else {
         println!("系统代理: 未开启");
-        println!("开启: clash proxy system on");
+        println!("开启: clash system on");
     }
     Ok(())
 }

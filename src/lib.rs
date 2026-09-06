@@ -9,6 +9,7 @@ mod cli;
 pub mod constants;
 mod core;
 mod http;
+mod machine;
 mod mixin;
 mod output;
 pub mod paths;
@@ -22,10 +23,11 @@ mod ui;
 mod update;
 mod utils;
 
-use anyhow::{Result, anyhow};
+use anyhow::Result;
 use clap::Parser;
 
 use crate::cli::{Cli, Commands};
+use crate::machine::{ActionSemantics, ErrorCode, coded_error};
 
 /// 解析当前进程参数并执行子命令（与二进制入口相同）。
 pub fn run() -> Result<()> {
@@ -39,7 +41,9 @@ where
     S: Into<std::ffi::OsString> + Clone,
 {
     let args: Vec<std::ffi::OsString> = args.into_iter().map(Into::into).collect();
-    match Cli::try_parse_from(args.clone()) {
+    let machine_requested = args.iter().any(|arg| arg == "--machine");
+
+    match Cli::try_parse_from(args) {
         Ok(cli) => run_cli(cli),
         Err(err) => {
             use clap::error::ErrorKind;
@@ -47,52 +51,65 @@ where
                 err.kind(),
                 ErrorKind::DisplayHelp | ErrorKind::DisplayVersion
             ) {
-                err.print().map_err(|e| anyhow!(e.to_string()))?;
+                err.print().map_err(anyhow::Error::from)?;
                 return Ok(());
             }
 
-            let force_json = args.iter().any(|arg| arg == "--json")
-                || std::env::var("CLASH_CLI_JSON")
-                    .map(|value| !matches!(value.as_str(), "" | "0" | "false" | "False" | "FALSE"))
-                    .unwrap_or(false);
-            let force_text = args.iter().any(|arg| arg == "--text");
-            let json = force_json || (!force_text && !output::stdout_is_tty());
-            output::set_json_mode(json);
-            if json {
-                return Err(anyhow!(err.to_string().trim().to_string()));
+            if machine_requested {
+                output::set_machine_mode(true);
+                output::set_machine_context("cli.parse", ActionSemantics::READ);
+                return Err(coded_error(
+                    ErrorCode::CliArgumentInvalid,
+                    err.to_string().trim().to_string(),
+                ));
             }
-            err.print().map_err(|e| anyhow!(e.to_string()))?;
-            Err(anyhow!("命令参数错误"))
+            Err(anyhow::anyhow!(err.to_string().trim().to_string()))
         }
     }
 }
 
 fn run_cli(cli: Cli) -> Result<()> {
-    let json = output::resolve_json_mode(
-        cli.json,
-        cli.text,
-        output::stdout_is_tty(),
-        cli.command.keeps_raw_stdout(),
-    );
-    output::set_json_mode(json);
+    let action = cli.command.canonical_action();
+    let semantics = cli.command.semantics();
+    output::set_machine_mode(cli.machine);
+    output::set_machine_context(action, semantics);
+
+    if cli.machine && !cli.command.machine_supported() {
+        return Err(coded_error(
+            ErrorCode::UnsupportedMachineAction,
+            format!("机器模式不支持 `{action}`；请改用可组合的原子命令，而不是交互式/持续流动作"),
+        ));
+    }
+    if cli.machine {
+        cli.command.validate_machine_inputs()?;
+    }
 
     match cli.command {
+        Commands::Contract => {
+            if output::is_machine_mode() {
+                output::print_machine(&machine::contract_description())?;
+            } else {
+                println!("Machine Contract: {}", machine::CONTRACT_VERSION);
+                println!("机器调用请显式使用: clash --machine <command> ...");
+                println!("完整机器契约: clash --machine contract");
+            }
+        }
         Commands::Ui { command } => ui::run(command)?,
-        Commands::Mode { action, common } => api::run(cli::ApiCommand::Mode {
-            action: action.unwrap_or(cli::ApiModeCommand::Get),
-            common,
-        })?,
+        Commands::Mode { action, common } => {
+            api::run_mode(action.unwrap_or(cli::ApiModeCommand::Get), common)?
+        }
         Commands::Sub { command } => profile::run(command)?,
         Commands::Proxy { command } => {
             let command = command.unwrap_or(cli::ProxyCommand::List(cli::ApiCommonArgs::default()));
-            match command.into_node_api() {
-                Ok(api_cmd) => api::run(api_cmd)?,
-                Err(shell_cmd) => proxy::run(shell_cmd)?,
+            match command {
+                cli::ProxyCommand::List(common) => api::run_proxy_list(common)?,
+                cli::ProxyCommand::Switch(args) => api::run_proxy_switch(args)?,
+                other => proxy::run(other)?,
             }
         }
-        Commands::System { action } => proxy::run(cli::ProxyCommand::System { action })?,
+        Commands::System { action } => proxy::run_system(action)?,
         Commands::Tun { command } => tun::run(command)?,
-        Commands::Env { action } => proxy::run(cli::ProxyCommand::Env { action })?,
+        Commands::Env { action } => proxy::run_env(action)?,
         Commands::Core { command } => core::run(command)?,
         Commands::Service { command } => service::run(command)?,
         Commands::Api { command } => api::run(command)?,
@@ -103,13 +120,9 @@ fn run_cli(cli: Cli) -> Result<()> {
     Ok(())
 }
 
-/// 按当前 `--json` 模式打印失败信息。
 pub fn print_run_error(err: &anyhow::Error) {
-    if output::is_json_mode() {
-        let _ = output::print_json(&serde_json::json!({
-            "ok": false,
-            "error": err.to_string()
-        }));
+    if output::is_machine_mode() {
+        let _ = output::print_machine_error(err);
     } else {
         eprintln!("Error: {err}");
     }

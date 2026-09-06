@@ -5,7 +5,7 @@ use serde_yaml::Value;
 
 use crate::auto_sudo;
 use crate::cli::{MixinCommand, MixinSetArgs};
-use crate::output::{is_json_mode, print_json};
+use crate::output::{is_machine_mode, print_machine};
 use crate::paths::app_paths;
 use crate::utils;
 
@@ -23,9 +23,9 @@ pub fn run(command: MixinCommand) -> Result<()> {
         Err(err) => {
             if mixin_command_requires_write(&retry_command)
                 && auto_sudo::is_permission_denied_error(&err)
-                && auto_sudo::should_auto_delegate(is_json_mode())
+                && auto_sudo::should_auto_delegate(is_machine_mode())
             {
-                if !is_json_mode() {
+                if !is_machine_mode() {
                     println!("检测到权限不足，正在请求 sudo 授权继续执行 mixin 命令...");
                 }
                 return run_mixin_with_sudo(&retry_command);
@@ -38,10 +38,8 @@ pub fn run(command: MixinCommand) -> Result<()> {
 fn cmd_show() -> Result<()> {
     let paths = app_paths()?;
     if !paths.profile_mixin_file.exists() {
-        if is_json_mode() {
-            return print_json(&serde_json::json!({
-                "ok": true,
-                "action": "profile.mixin.show",
+        if is_machine_mode() {
+            return print_machine(&serde_json::json!({
                 "exists": false,
                 "content": null,
             }));
@@ -50,7 +48,7 @@ fn cmd_show() -> Result<()> {
             "mixin.yaml 不存在（路径: {}）",
             paths.profile_mixin_file.display()
         );
-        println!("提示: 使用 `clash profile mixin set --key <key> --value <value>` 创建");
+        println!("提示: 使用 `clash sub mixin set --key <key> --value <value>` 创建");
         return Ok(());
     }
 
@@ -61,11 +59,9 @@ fn cmd_show() -> Result<()> {
         )
     })?;
 
-    if is_json_mode() {
+    if is_machine_mode() {
         let parsed: Value = serde_yaml::from_str(&content).unwrap_or(Value::Null);
-        return print_json(&serde_json::json!({
-            "ok": true,
-            "action": "profile.mixin.show",
+        return print_machine(&serde_json::json!({
             "exists": true,
             "content": yaml_to_json(&parsed),
         }));
@@ -88,17 +84,15 @@ fn cmd_set(args: MixinSetArgs) -> Result<()> {
 
     save_mixin(&paths.profile_mixin_file, &root)?;
 
-    if is_json_mode() {
-        return print_json(&serde_json::json!({
-            "ok": true,
-            "action": "profile.mixin.set",
+    if is_machine_mode() {
+        return print_machine(&serde_json::json!({
             "key": args.key,
             "value": args.value,
         }));
     }
 
     println!("已设置 mixin: {} = {}", args.key, args.value);
-    println!("提示: 执行 `clash profile render` 使变更生效");
+    println!("提示: 执行 `clash sub render` 使变更生效");
     Ok(())
 }
 
@@ -112,10 +106,8 @@ fn cmd_unset(args: MixinSetArgs) -> Result<()> {
     let removed = unset_nested_key(&mut root, &args.key);
 
     if !removed {
-        if is_json_mode() {
-            return print_json(&serde_json::json!({
-                "ok": true,
-                "action": "profile.mixin.unset",
+        if is_machine_mode() {
+            return print_machine(&serde_json::json!({
                 "key": args.key,
                 "removed": false,
             }));
@@ -126,27 +118,23 @@ fn cmd_unset(args: MixinSetArgs) -> Result<()> {
 
     save_mixin(&paths.profile_mixin_file, &root)?;
 
-    if is_json_mode() {
-        return print_json(&serde_json::json!({
-            "ok": true,
-            "action": "profile.mixin.unset",
+    if is_machine_mode() {
+        return print_machine(&serde_json::json!({
             "key": args.key,
             "removed": true,
         }));
     }
 
     println!("已删除 mixin 字段: {}", args.key);
-    println!("提示: 执行 `clash profile render` 使变更生效");
+    println!("提示: 执行 `clash sub render` 使变更生效");
     Ok(())
 }
 
 fn cmd_reset() -> Result<()> {
     let paths = app_paths()?;
     if !paths.profile_mixin_file.exists() {
-        if is_json_mode() {
-            return print_json(&serde_json::json!({
-                "ok": true,
-                "action": "profile.mixin.reset",
+        if is_machine_mode() {
+            return print_machine(&serde_json::json!({
                 "existed": false,
             }));
         }
@@ -161,16 +149,14 @@ fn cmd_reset() -> Result<()> {
         )
     })?;
 
-    if is_json_mode() {
-        return print_json(&serde_json::json!({
-            "ok": true,
-            "action": "profile.mixin.reset",
+    if is_machine_mode() {
+        return print_machine(&serde_json::json!({
             "existed": true,
         }));
     }
 
     println!("已重置 mixin.yaml。");
-    println!("提示: 执行 `clash profile render` 使变更生效");
+    println!("提示: 执行 `clash sub render` 使变更生效");
     Ok(())
 }
 
@@ -321,7 +307,7 @@ fn mixin_command_requires_write(command: &MixinCommand) -> bool {
 
 fn run_mixin_with_sudo(command: &MixinCommand) -> Result<()> {
     let cli_args = mixin_command_to_cli_args(command);
-    let status = auto_sudo::run_with_sudo(is_json_mode(), |cmd| {
+    let status = auto_sudo::run_with_sudo(is_machine_mode(), |cmd| {
         cmd.args(&cli_args);
         Ok(())
     })?;
@@ -332,7 +318,7 @@ fn run_mixin_with_sudo(command: &MixinCommand) -> Result<()> {
 }
 
 fn mixin_command_to_cli_args(command: &MixinCommand) -> Vec<String> {
-    let mut args = vec!["profile".to_string(), "mixin".to_string()];
+    let mut args = vec!["sub".to_string(), "mixin".to_string()];
     match command {
         MixinCommand::Show => args.push("show".to_string()),
         MixinCommand::Set(v) => {

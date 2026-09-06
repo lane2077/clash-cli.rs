@@ -9,7 +9,8 @@ use zip::ZipArchive;
 use crate::cli::{UiCommand, UiInstallArgs};
 use crate::constants;
 use crate::http::{build_http_client, download_candidates, download_to_file};
-use crate::output::{is_json_mode, print_json};
+use crate::machine::{ErrorCode, coded_error};
+use crate::output::{is_machine_mode, print_machine};
 use crate::paths::app_paths;
 
 pub fn run(command: Option<UiCommand>) -> Result<()> {
@@ -35,12 +36,46 @@ pub fn ui_is_installed(ui_dir: &Path) -> bool {
 
 pub fn dashboard_url_from_runtime() -> Result<String> {
     let paths = app_paths()?;
-    let controller = read_controller(&paths.runtime_config_file)
-        .unwrap_or_else(|| constants::DEFAULT_CONTROLLER.to_string());
+    let controller = if is_machine_mode() {
+        read_controller_strict(&paths.runtime_config_file)?
+    } else {
+        read_controller(&paths.runtime_config_file)
+            .unwrap_or_else(|| constants::DEFAULT_CONTROLLER.to_string())
+    };
     Ok(format!(
         "{}/ui",
         normalize_controller_url(&controller).trim_end_matches('/')
     ))
+}
+
+fn read_controller_strict(path: &Path) -> Result<String> {
+    if !path.is_file() {
+        return Err(coded_error(
+            ErrorCode::RuntimeConfigRequired,
+            format!(
+                "需要已渲染 runtime 配置才能确定 Dashboard URL: {}",
+                path.display()
+            ),
+        ));
+    }
+    let content = fs::read_to_string(path)
+        .with_context(|| format!("读取 runtime 配置失败: {}", path.display()))?;
+    let root: serde_yaml::Value = serde_yaml::from_str(&content).map_err(|err| {
+        coded_error(
+            ErrorCode::ConfigInvalid,
+            format!("解析 runtime 配置失败 {}: {err}", path.display()),
+        )
+    })?;
+    root.as_mapping()
+        .and_then(|m| m.get(serde_yaml::Value::String("external-controller".into())))
+        .and_then(|v| v.as_str())
+        .map(str::to_string)
+        .ok_or_else(|| {
+            coded_error(
+                ErrorCode::ConfigInvalid,
+                "runtime 缺少 external-controller，拒绝猜测 Dashboard 地址",
+            )
+        })
 }
 
 /// 解压 metacubexd / GitHub zip：剥掉单一顶层目录，拒绝 `..` 路径。
@@ -145,10 +180,8 @@ fn common_root_prefix(zip: &mut ZipArchive<File>) -> Result<Option<PathBuf>> {
 fn cmd_install(args: UiInstallArgs) -> Result<()> {
     let ui_dir = resolve_ui_dir(args.workdir.as_deref())?;
     if ui_is_installed(&ui_dir) && !args.force {
-        if is_json_mode() {
-            return print_json(&serde_json::json!({
-                "ok": true,
-                "action": "ui.install",
+        if is_machine_mode() {
+            return print_machine(&serde_json::json!({
                 "reused": true,
                 "path": ui_dir.display().to_string(),
             }));
@@ -200,17 +233,17 @@ fn cmd_install(args: UiInstallArgs) -> Result<()> {
     let _ = fs::remove_file(&tmp_zip);
     extract_result?;
 
-    let url = dashboard_url_from_runtime().unwrap_or_else(|_| "http://127.0.0.1:9090/ui".into());
-    if is_json_mode() {
-        return print_json(&serde_json::json!({
-            "ok": true,
-            "action": "ui.install",
+    if is_machine_mode() {
+        let url = dashboard_url_from_runtime().ok();
+        return print_machine(&serde_json::json!({
             "reused": false,
             "path": ui_dir.display().to_string(),
             "source": source,
             "url": url,
+            "url_available": url.is_some(),
         }));
     }
+    let url = dashboard_url_from_runtime().unwrap_or_else(|_| "http://127.0.0.1:9090/ui".into());
     println!("已安装 Web UI (metacubexd): {}", ui_dir.display());
     println!("来源: {}", source);
     println!("浏览器打开: {}", url);
@@ -221,17 +254,17 @@ fn cmd_install(args: UiInstallArgs) -> Result<()> {
 fn cmd_status() -> Result<()> {
     let ui_dir = resolve_ui_dir(None)?;
     let installed = ui_is_installed(&ui_dir);
-    let url = dashboard_url_from_runtime().unwrap_or_else(|_| "http://127.0.0.1:9090/ui".into());
-    if is_json_mode() {
-        return print_json(&serde_json::json!({
-            "ok": true,
-            "action": "ui.status",
+    if is_machine_mode() {
+        let url = dashboard_url_from_runtime().ok();
+        return print_machine(&serde_json::json!({
             "installed": installed,
             "path": ui_dir.display().to_string(),
             "url": url,
+            "url_available": url.is_some(),
             "name": constants::DEFAULT_EXTERNAL_UI_NAME,
         }));
     }
+    let url = dashboard_url_from_runtime().unwrap_or_else(|_| "http://127.0.0.1:9090/ui".into());
     if installed {
         println!("Web UI: 已安装 ({})", constants::DEFAULT_EXTERNAL_UI_NAME);
         println!("目录: {}", ui_dir.display());
@@ -247,10 +280,8 @@ fn cmd_status() -> Result<()> {
 
 fn cmd_url() -> Result<()> {
     let url = dashboard_url_from_runtime()?;
-    if is_json_mode() {
-        return print_json(&serde_json::json!({
-            "ok": true,
-            "action": "ui.url",
+    if is_machine_mode() {
+        return print_machine(&serde_json::json!({
             "url": url,
         }));
     }
@@ -265,10 +296,8 @@ fn cmd_open() -> Result<()> {
         bail!("尚未安装 Web UI，请先执行: clash ui install");
     }
     let opened = try_open_browser(&url);
-    if is_json_mode() {
-        return print_json(&serde_json::json!({
-            "ok": true,
-            "action": "ui.open",
+    if is_machine_mode() {
+        return print_machine(&serde_json::json!({
             "url": url,
             "opened": opened,
         }));

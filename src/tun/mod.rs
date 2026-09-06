@@ -14,7 +14,7 @@ use serde_yaml::{Mapping, Value};
 use crate::cli::{TunApplyArgs, TunCommand, TunStatusArgs};
 use crate::constants::DEFAULT_REDIR_PORT;
 use crate::mixin;
-use crate::output::{is_json_mode, print_json};
+use crate::output::{is_machine_mode, print_machine};
 use crate::paths::app_paths;
 use crate::profile;
 use crate::utils::{self, command_exists, ensure_supported_host, normalize_unit_name, now_unix};
@@ -43,7 +43,7 @@ fn cmd_on(args: TunApplyArgs) -> Result<()> {
     if ensure_tun_privileges_or_delegate(TunAction::On, &args)? == PrivilegeCheck::Delegated {
         return Ok(());
     }
-    let json_mode = is_json_mode();
+    let json_mode = is_machine_mode();
 
     if utils::is_linux() && !Path::new("/dev/net/tun").exists() {
         bail!("未找到 /dev/net/tun，请先修复系统环境");
@@ -98,9 +98,7 @@ fn cmd_on(args: TunApplyArgs) -> Result<()> {
     };
 
     if json_mode {
-        return print_json(&serde_json::json!({
-            "ok": true,
-            "action": "tun.on",
+        return print_machine(&serde_json::json!({
             "config_path": paths.runtime_config_file.display().to_string(),
             "service": normalize_unit_name(&args.name),
             "user_service": args.user,
@@ -128,7 +126,7 @@ fn cmd_off(args: TunApplyArgs) -> Result<()> {
     if ensure_tun_privileges_or_delegate(TunAction::Off, &args)? == PrivilegeCheck::Delegated {
         return Ok(());
     }
-    let json_mode = is_json_mode();
+    let json_mode = is_machine_mode();
     let paths = app_paths()?;
     let mut overlay = mixin::load_mixin_or_empty(&paths.profile_mixin_file)?;
     apply_tun_policy_overlay(&mut overlay, false);
@@ -160,9 +158,7 @@ fn cmd_off(args: TunApplyArgs) -> Result<()> {
     };
 
     if json_mode {
-        return print_json(&serde_json::json!({
-            "ok": true,
-            "action": "tun.off",
+        return print_machine(&serde_json::json!({
             "config_path": paths.runtime_config_file.display().to_string(),
             "service": normalize_unit_name(&args.name),
             "user_service": args.user,
@@ -185,7 +181,7 @@ fn cmd_status(args: TunStatusArgs) -> Result<()> {
     let root = if paths.runtime_config_file.exists() {
         load_existing_config(&paths.runtime_config_file)?
     } else {
-        if !is_json_mode() {
+        if !is_machine_mode() {
             println!(
                 "未找到运行配置文件，将按未配置状态展示: {}",
                 paths.runtime_config_file.display()
@@ -200,7 +196,7 @@ fn cmd_status(args: TunStatusArgs) -> Result<()> {
     let _auto_redirect = bool_field(tun, "auto-redirect").unwrap_or(false);
     let redir_port = u16_field(Some(&root), "redir-port").unwrap_or(DEFAULT_REDIR_PORT);
 
-    if !is_json_mode() {
+    if !is_machine_mode() {
         println!("tun 配置文件: {}", paths.runtime_config_file.display());
         println!("配置状态: {}", if tun_enable { "已开启" } else { "已关闭" });
         println!("redir-port: {}", redir_port);
@@ -245,7 +241,7 @@ fn cmd_status(args: TunStatusArgs) -> Result<()> {
     // 数据面由内核 auto-route / auto-redirect 管理，CLI 自建表缺失不视为失败。
     let actual_ok = interface_ready.map(|ready| actual_tun_ok(tun_enable, ready, service_active));
 
-    if is_json_mode() {
+    if is_machine_mode() {
         let last_state_json = match last_state {
             Some(state) => serde_json::json!({
                 "enabled": state.enabled,
@@ -258,9 +254,7 @@ fn cmd_status(args: TunStatusArgs) -> Result<()> {
             }),
             None => serde_json::Value::Null,
         };
-        return print_json(&serde_json::json!({
-            "ok": true,
-            "action": "tun.status",
+        return print_machine(&serde_json::json!({
             "config": {
                 "path": paths.runtime_config_file.display().to_string(),
                 "tun_enable": tun_enable,
@@ -418,13 +412,13 @@ pub(super) fn run_cmd(program: &str, args: &[&str]) -> Result<()> {
 fn restart_service_best_effort(name: &str, user: bool) -> bool {
     match crate::service::restart_managed_service(name, user) {
         Ok(()) => {
-            if !is_json_mode() {
+            if !is_machine_mode() {
                 println!("已重启服务: {}", name);
             }
             true
         }
         Err(err) => {
-            if !is_json_mode() {
+            if !is_machine_mode() {
                 eprintln!("警告: 自动重启服务失败: {}", err);
                 eprintln!(
                     "请手动执行: clash service restart --name {}{}",

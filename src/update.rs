@@ -13,7 +13,8 @@ use tar::Archive;
 use crate::auto_sudo;
 use crate::cli::{MirrorSource, UpdateCommand};
 use crate::http::{build_http_client, download_candidates, download_to_file};
-use crate::output::{is_json_mode, print_json};
+use crate::machine::{ErrorCode, coded_error};
+use crate::output::{is_machine_mode, print_machine};
 use crate::utils;
 
 const CLI_REPO: &str = "lane2077/clash-cli.rs";
@@ -48,10 +49,8 @@ fn cmd_check(mirror: MirrorSource) -> Result<()> {
     let latest = &release.tag_name;
     let is_latest = normalize_version(&current) == normalize_version(latest);
 
-    if is_json_mode() {
-        return print_json(&serde_json::json!({
-            "ok": true,
-            "action": "update.check",
+    if is_machine_mode() {
+        return print_machine(&serde_json::json!({
             "current_version": current,
             "latest_version": latest,
             "is_latest": is_latest,
@@ -75,15 +74,18 @@ fn cmd_update(mirror: MirrorSource, expected_sha256: Option<String>) -> Result<(
     if let Some(v) = expected_sha256.as_ref()
         && !is_valid_sha256(v)
     {
-        bail!("SHA256 参数格式不合法: {v}");
+        return Err(coded_error(
+            ErrorCode::CliArgumentInvalid,
+            format!("SHA256 参数格式不合法: {v}"),
+        ));
     }
 
     // 检查是否需要 sudo
-    if needs_sudo(&current_exe) && auto_sudo::should_auto_delegate(is_json_mode()) {
-        if !is_json_mode() {
+    if needs_sudo(&current_exe) && auto_sudo::should_auto_delegate(is_machine_mode()) {
+        if !is_machine_mode() {
             println!("检测到权限不足，正在请求 sudo 授权继续执行 update ...");
         }
-        let status = auto_sudo::run_with_sudo(is_json_mode(), |cmd| {
+        let status = auto_sudo::run_with_sudo(is_machine_mode(), |cmd| {
             cmd.arg("update").arg("run");
             cmd.arg("--mirror").arg(mirror_str(mirror));
             if let Some(v) = &expected_sha256 {
@@ -103,10 +105,8 @@ fn cmd_update(mirror: MirrorSource, expected_sha256: Option<String>) -> Result<(
     let latest = &release.tag_name;
 
     if normalize_version(&current) == normalize_version(latest) {
-        if is_json_mode() {
-            return print_json(&serde_json::json!({
-                "ok": true,
-                "action": "update.run",
+        if is_machine_mode() {
+            return print_machine(&serde_json::json!({
                 "current_version": current,
                 "latest_version": latest,
                 "updated": false,
@@ -128,8 +128,12 @@ fn cmd_update(mirror: MirrorSource, expected_sha256: Option<String>) -> Result<(
                 } else {
                     parse_checksum_from_release_assets(&release.assets, &asset.name)?
                 };
-            trusted
-                .with_context(|| format!("发布资产 {} 缺少可信 SHA256，已拒绝自更新", asset.name))?
+            trusted.ok_or_else(|| {
+                coded_error(
+                    ErrorCode::ChecksumMismatch,
+                    format!("发布资产 {} 缺少可信 SHA256，已拒绝自更新", asset.name),
+                )
+            })?
         }
     };
 
@@ -150,14 +154,20 @@ fn cmd_update(mirror: MirrorSource, expected_sha256: Option<String>) -> Result<(
         Some(url) => url,
         None => {
             let _ = fs::remove_file(&tmp_archive);
-            bail!("下载失败，已尝试所有源:\n{}", errors.join("\n"));
+            return Err(coded_error(
+                ErrorCode::NetworkError,
+                format!("下载失败，已尝试所有源:\n{}", errors.join("\n")),
+            ));
         }
     };
 
     let actual_sha256 = sha256_hex(&tmp_archive)?;
     if !compare_sha256(&actual_sha256, &checksum) {
         let _ = fs::remove_file(&tmp_archive);
-        bail!("SHA256 校验失败: expected={checksum}, actual={actual_sha256}");
+        return Err(coded_error(
+            ErrorCode::ChecksumMismatch,
+            format!("SHA256 校验失败: expected={checksum}, actual={actual_sha256}"),
+        ));
     }
 
     let tmp_dir = current_exe.with_extension("update_tmp");
@@ -184,10 +194,8 @@ fn cmd_update(mirror: MirrorSource, expected_sha256: Option<String>) -> Result<(
     let _ = fs::remove_file(&tmp_archive);
     let _ = fs::remove_dir_all(&tmp_dir);
 
-    if is_json_mode() {
-        return print_json(&serde_json::json!({
-            "ok": true,
-            "action": "update.run",
+    if is_machine_mode() {
+        return print_machine(&serde_json::json!({
             "current_version": current,
             "latest_version": latest,
             "updated": true,

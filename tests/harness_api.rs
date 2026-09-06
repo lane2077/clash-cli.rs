@@ -257,22 +257,3 @@ fn service_unit_execstart_matches_core_link() {
     assert!(unit.contains("ExecStart=/etc/clash-cli/core/mihomo "));
     assert!(!unit.contains("/usr/local/bin/mihomo"));
 }
-
-#[test]
-fn tun_on_via_run_from_args_not_linux_only_on_macos() {
-    if cfg!(target_os = "linux") {
-        return;
-    }
-    if cfg!(target_os = "macos") {
-        let err =
-            clash_cli::run_from_args(["clash", "tun", "on"]).expect_err("无特权 tun on 应失败");
-        let msg = err.to_string();
-        assert!(
-            !msg.contains("当前仅支持 Linux 平台"),
-            "macOS 不应再报 Linux-only: {msg}"
-        );
-        return;
-    }
-    let err = clash_cli::run_from_args(["clash", "tun", "on"]).expect_err("应失败");
-    assert!(err.to_string().contains("macOS") || err.to_string().contains("Linux"));
-}

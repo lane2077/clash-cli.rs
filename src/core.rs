@@ -14,7 +14,8 @@ use sha2::{Digest, Sha256};
 
 use crate::cli::{Amd64Variant, CoreCommand, CoreInstallArgs, CoreUpgradeArgs, MirrorSource};
 use crate::http::{build_http_client, download_candidates, download_to_file};
-use crate::output::{is_json_mode, print_json};
+use crate::machine::{ErrorCode, coded_error};
+use crate::output::{is_machine_mode, print_machine};
 use crate::paths::app_paths;
 use crate::utils::{command_exists, is_root_user, write_atomic_text};
 
@@ -84,10 +85,8 @@ fn cmd_upgrade(args: CoreUpgradeArgs) -> Result<()> {
 fn cmd_version() -> Result<()> {
     let paths = app_paths()?;
     if !paths.core_meta_file.exists() {
-        if is_json_mode() {
-            return print_json(&serde_json::json!({
-                "ok": true,
-                "action": "core.version",
+        if is_machine_mode() {
+            return print_machine(&serde_json::json!({
                 "installed": false,
                 "version": null
             }));
@@ -96,10 +95,8 @@ fn cmd_version() -> Result<()> {
         return Ok(());
     }
     let meta = load_core_meta(&paths.core_meta_file)?;
-    if is_json_mode() {
-        return print_json(&serde_json::json!({
-            "ok": true,
-            "action": "core.version",
+    if is_machine_mode() {
+        return print_machine(&serde_json::json!({
             "installed": true,
             "version": meta.version
         }));
@@ -111,10 +108,8 @@ fn cmd_version() -> Result<()> {
 fn cmd_path() -> Result<()> {
     let paths = app_paths()?;
     if !paths.core_current_link.exists() {
-        if is_json_mode() {
-            return print_json(&serde_json::json!({
-                "ok": true,
-                "action": "core.path",
+        if is_machine_mode() {
+            return print_machine(&serde_json::json!({
                 "installed": false,
                 "path": null
             }));
@@ -122,10 +117,8 @@ fn cmd_path() -> Result<()> {
         println!("内核状态: 未安装");
         return Ok(());
     }
-    if is_json_mode() {
-        return print_json(&serde_json::json!({
-            "ok": true,
-            "action": "core.path",
+    if is_machine_mode() {
+        return print_machine(&serde_json::json!({
             "installed": true,
             "path": paths.core_current_link.display().to_string()
         }));
@@ -157,10 +150,8 @@ fn install_mihomo_core(request: CoreInstallRequest) -> Result<()> {
             &asset.name,
             &asset.browser_download_url,
         )?;
-        if is_json_mode() {
-            return print_json(&serde_json::json!({
-                "ok": true,
-                "action": "core.install",
+        if is_machine_mode() {
+            return print_machine(&serde_json::json!({
                 "version": tag,
                 "asset": asset.name,
                 "path": installed_binary.display().to_string(),
@@ -195,14 +186,22 @@ fn install_mihomo_core(request: CoreInstallRequest) -> Result<()> {
 
     let source_url = match chosen_url {
         Some(url) => url,
-        None => bail!("下载失败，已尝试所有源:\n{}", errors.join("\n")),
+        None => {
+            return Err(coded_error(
+                ErrorCode::NetworkError,
+                format!("下载失败，已尝试所有源:\n{}", errors.join("\n")),
+            ));
+        }
     };
 
     let expected_sha256 = asset_sha256(&asset)?;
     let actual_sha256 = sha256_hex(&temp_gz_path)?;
     if !actual_sha256.eq_ignore_ascii_case(&expected_sha256) {
         let _ = fs::remove_file(&temp_gz_path);
-        bail!("mihomo 下载校验失败: expected={expected_sha256}, actual={actual_sha256}");
+        return Err(coded_error(
+            ErrorCode::ChecksumMismatch,
+            format!("mihomo 下载校验失败: expected={expected_sha256}, actual={actual_sha256}"),
+        ));
     }
 
     decompress_gzip_to_file(&temp_gz_path, &temp_bin_path)?;
@@ -221,10 +220,8 @@ fn install_mihomo_core(request: CoreInstallRequest) -> Result<()> {
     point_current_core(&paths.core_current_link, &installed_binary)?;
     write_core_meta(&paths.core_meta_file, &tag, &asset.name, &source_url)?;
 
-    if is_json_mode() {
-        return print_json(&serde_json::json!({
-            "ok": true,
-            "action": "core.install",
+    if is_machine_mode() {
+        return print_machine(&serde_json::json!({
             "version": tag,
             "asset": asset.name,
             "path": installed_binary.display().to_string(),
@@ -374,10 +371,13 @@ fn asset_sha256(asset: &GitHubAsset) -> Result<String> {
         .as_deref()
         .and_then(|value| value.strip_prefix("sha256:"))
         .filter(|value| value.len() == 64 && value.chars().all(|c| c.is_ascii_hexdigit()))
-        .with_context(|| {
-            format!(
-                "GitHub 发布资产 {} 缺少可信 SHA256 digest，已拒绝安装",
-                asset.name
+        .ok_or_else(|| {
+            coded_error(
+                ErrorCode::ChecksumMismatch,
+                format!(
+                    "GitHub 发布资产 {} 缺少可信 SHA256 digest，已拒绝安装",
+                    asset.name
+                ),
             )
         })?;
     Ok(digest.to_string())

@@ -8,7 +8,8 @@ use crate::cli::{
     ServiceCommand, ServiceInstallArgs, ServiceLogArgs, ServiceTargetArgs, ServiceUninstallArgs,
 };
 use crate::constants;
-use crate::output::{is_json_mode, print_json};
+use crate::machine::{ErrorCode, coded_error};
+use crate::output::{is_machine_mode, print_machine};
 use crate::paths::app_paths;
 use crate::utils;
 
@@ -82,7 +83,7 @@ fn cmd_install(args: ServiceInstallArgs) -> Result<()> {
 
     run_systemctl_raw(args.target.user, &["daemon-reload".to_string()])?;
 
-    if !is_json_mode() {
+    if !is_machine_mode() {
         println!("service unit 安装完成: {}", unit_path.display());
         println!("服务名: {}", unit_name);
         println!("工作目录: {}", workdir.display());
@@ -94,29 +95,27 @@ fn cmd_install(args: ServiceInstallArgs) -> Result<()> {
     if !args.no_enable {
         run_systemctl_unit_action(&args.target, "enable")?;
         enabled = true;
-        if !is_json_mode() {
+        if !is_machine_mode() {
             println!("已启用开机自启。");
         }
     }
 
     let mut started = false;
     if created_template {
-        if !is_json_mode() {
+        if !is_machine_mode() {
             println!("检测到配置不存在，已生成模板配置。");
             println!("请先编辑配置后再启动: {}", config.display());
         }
     } else if !args.no_start {
         run_systemctl_unit_action(&args.target, "start")?;
         started = true;
-        if !is_json_mode() {
+        if !is_machine_mode() {
             println!("服务已启动。");
         }
     }
 
-    if is_json_mode() {
-        return print_json(&serde_json::json!({
-            "ok": true,
-            "action": "service.install",
+    if is_machine_mode() {
+        return print_machine(&serde_json::json!({
             "unit": unit_name,
             "unit_path": unit_path.display().to_string(),
             "workdir": workdir.display().to_string(),
@@ -153,15 +152,15 @@ fn cmd_uninstall(args: ServiceUninstallArgs) -> Result<()> {
         fs::remove_file(&unit_path)
             .with_context(|| format!("删除 unit 失败: {}", unit_path.display()))?;
         unit_deleted = true;
-        if !is_json_mode() {
+        if !is_machine_mode() {
             println!("已删除 unit: {}", unit_path.display());
         }
-    } else if !is_json_mode() {
+    } else if !is_machine_mode() {
         println!("unit 不存在，无需删除: {}", unit_path.display());
     }
 
     run_systemctl_raw(args.target.user, &["daemon-reload".to_string()])?;
-    if !is_json_mode() {
+    if !is_machine_mode() {
         println!("已完成 systemd daemon-reload。");
     }
 
@@ -172,10 +171,10 @@ fn cmd_uninstall(args: ServiceUninstallArgs) -> Result<()> {
                 format!("清理 runtime 目录失败: {}", paths.runtime_dir.display())
             })?;
             runtime_purged = true;
-            if !is_json_mode() {
+            if !is_machine_mode() {
                 println!("已清理 runtime 目录: {}", paths.runtime_dir.display());
             }
-        } else if !is_json_mode() {
+        } else if !is_machine_mode() {
             println!(
                 "runtime 目录不存在，无需清理: {}",
                 paths.runtime_dir.display()
@@ -183,10 +182,8 @@ fn cmd_uninstall(args: ServiceUninstallArgs) -> Result<()> {
         }
     }
 
-    if is_json_mode() {
-        return print_json(&serde_json::json!({
-            "ok": true,
-            "action": "service.uninstall",
+    if is_machine_mode() {
+        return print_machine(&serde_json::json!({
             "unit": unit_name,
             "unit_path": unit_path.display().to_string(),
             "unit_deleted": unit_deleted,
@@ -205,10 +202,8 @@ fn cmd_simple_action(target: ServiceTargetArgs, action: &str) -> Result<()> {
         return darwin_cmd_simple_action(target, action);
     }
     run_systemctl_unit_action(&target, action)?;
-    if is_json_mode() {
-        return print_json(&serde_json::json!({
-            "ok": true,
-            "action": format!("service.{action}"),
+    if is_machine_mode() {
+        return print_machine(&serde_json::json!({
             "unit": utils::normalize_unit_name(&target.name),
             "user": target.user
         }));
@@ -234,10 +229,8 @@ fn cmd_status(target: ServiceTargetArgs) -> Result<()> {
 
     let args = vec!["status".to_string(), unit, "--no-pager".to_string()];
     let output = run_systemctl_raw(target.user, &args)?;
-    if is_json_mode() {
-        return print_json(&serde_json::json!({
-            "ok": true,
-            "action": "service.status",
+    if is_machine_mode() {
+        return print_machine(&serde_json::json!({
             "unit": utils::normalize_unit_name(&target.name),
             "user": target.user,
             "stdout": output.stdout,
@@ -254,9 +247,9 @@ fn cmd_log(args: ServiceLogArgs) -> Result<()> {
     }
     let unit = utils::normalize_unit_name(&args.target.name);
 
-    if is_json_mode() {
+    if is_machine_mode() {
         if args.follow {
-            bail!("--json 模式暂不支持 `service log --follow`");
+            bail!("--machine 模式不支持 `service log --follow`");
         }
         let mut cmd = Command::new("journalctl");
         if args.target.user {
@@ -273,9 +266,7 @@ fn cmd_log(args: ServiceLogArgs) -> Result<()> {
         if !output.status.success() {
             bail!("journalctl 返回非成功状态: {}", output.status);
         }
-        return print_json(&serde_json::json!({
-            "ok": true,
-            "action": "service.log",
+        return print_machine(&serde_json::json!({
             "unit": unit,
             "user": args.target.user,
             "lines": args.lines,
@@ -310,7 +301,7 @@ fn run_systemctl_unit_action(target: &ServiceTargetArgs, action: &str) -> Result
 
 fn run_systemctl_unit_action_best_effort(target: &ServiceTargetArgs, action: &str, msg: &str) {
     if let Err(err) = run_systemctl_unit_action(target, action)
-        && !is_json_mode()
+        && !is_machine_mode()
     {
         eprintln!("警告: {}: {}", msg, err);
     }
@@ -325,10 +316,15 @@ fn run_systemctl_raw(user: bool, args: &[String]) -> Result<CmdCapturedOutput> {
         cmd.arg(arg);
     }
 
-    let output = cmd.output().context("执行 systemctl 失败")?;
+    let output = cmd.output().map_err(|err| {
+        coded_error(
+            ErrorCode::ServiceOperationFailed,
+            format!("执行 systemctl 失败: {err}"),
+        )
+    })?;
     let stdout = String::from_utf8_lossy(&output.stdout).to_string();
     let stderr = String::from_utf8_lossy(&output.stderr).to_string();
-    if !is_json_mode() {
+    if !is_machine_mode() {
         if !stdout.is_empty() {
             print!("{}", stdout);
         }
@@ -337,12 +333,15 @@ fn run_systemctl_raw(user: bool, args: &[String]) -> Result<CmdCapturedOutput> {
         }
     }
     if !output.status.success() {
-        bail!(
-            "systemctl 返回非成功状态: {} (stdout={}, stderr={})",
-            output.status,
-            stdout.trim(),
-            stderr.trim()
-        );
+        return Err(coded_error(
+            ErrorCode::ServiceOperationFailed,
+            format!(
+                "systemctl 返回非成功状态: {} (stdout={}, stderr={})",
+                output.status,
+                stdout.trim(),
+                stderr.trim()
+            ),
+        ));
     }
     Ok(CmdCapturedOutput { stdout, stderr })
 }
@@ -549,10 +548,15 @@ fn launchctl(args: &[&str]) -> Result<CmdCapturedOutput> {
     let output = Command::new("launchctl")
         .args(args)
         .output()
-        .context("执行 launchctl 失败")?;
+        .map_err(|err| {
+            coded_error(
+                ErrorCode::ServiceOperationFailed,
+                format!("执行 launchctl 失败: {err}"),
+            )
+        })?;
     let stdout = String::from_utf8_lossy(&output.stdout).to_string();
     let stderr = String::from_utf8_lossy(&output.stderr).to_string();
-    if !is_json_mode() {
+    if !is_machine_mode() {
         if !stdout.is_empty() {
             print!("{}", stdout);
         }
@@ -561,12 +565,15 @@ fn launchctl(args: &[&str]) -> Result<CmdCapturedOutput> {
         }
     }
     if !output.status.success() {
-        bail!(
-            "launchctl 失败: {} (stdout={}, stderr={})",
-            output.status,
-            stdout.trim(),
-            stderr.trim()
-        );
+        return Err(coded_error(
+            ErrorCode::ServiceOperationFailed,
+            format!(
+                "launchctl 失败: {} (stdout={}, stderr={})",
+                output.status,
+                stdout.trim(),
+                stderr.trim()
+            ),
+        ));
     }
     Ok(CmdCapturedOutput { stdout, stderr })
 }
@@ -631,10 +638,8 @@ fn darwin_cmd_install(args: ServiceInstallArgs) -> Result<()> {
         }
     }
 
-    if is_json_mode() {
-        return print_json(&serde_json::json!({
-            "ok": true,
-            "action": "service.install",
+    if is_machine_mode() {
+        return print_machine(&serde_json::json!({
             "unit": label,
             "unit_path": plist_path.display().to_string(),
             "workdir": workdir.display().to_string(),
@@ -679,10 +684,8 @@ fn darwin_cmd_uninstall(args: ServiceUninstallArgs) -> Result<()> {
         fs::remove_dir_all(&paths.runtime_dir).context("清理 runtime 目录失败")?;
         runtime_purged = true;
     }
-    if is_json_mode() {
-        return print_json(&serde_json::json!({
-            "ok": true,
-            "action": "service.uninstall",
+    if is_machine_mode() {
+        return print_machine(&serde_json::json!({
             "unit": label,
             "unit_path": plist_path.display().to_string(),
             "unit_deleted": deleted,
@@ -737,10 +740,8 @@ fn darwin_cmd_simple_action(target: ServiceTargetArgs, action: &str) -> Result<(
     darwin_run_simple_action(&target, action)?;
     let label = launchd_label(&target.name);
     let user_agent = darwin_use_user_agent(target.user);
-    if is_json_mode() {
-        return print_json(&serde_json::json!({
-            "ok": true,
-            "action": format!("service.{action}"),
+    if is_machine_mode() {
+        return print_machine(&serde_json::json!({
             "unit": label,
             "user": user_agent,
             "backend": "launchd"
@@ -771,10 +772,8 @@ fn darwin_cmd_status(target: ServiceTargetArgs) -> Result<()> {
         })
         .unwrap_or(false);
     let stdout = status.map(|out| out.stdout).unwrap_or_default();
-    if is_json_mode() {
-        return print_json(&serde_json::json!({
-            "ok": true,
-            "action": "service.status",
+    if is_machine_mode() {
+        return print_machine(&serde_json::json!({
             "unit": label,
             "user": user_agent,
             "running": running,
@@ -799,18 +798,16 @@ fn darwin_cmd_log(args: ServiceLogArgs) -> Result<()> {
     let paths = app_paths()?;
     let workdir = paths.runtime_dir;
     let log_path = workdir.join("mihomo.stderr.log");
-    if is_json_mode() {
+    if is_machine_mode() {
         if args.follow {
-            bail!("--json 模式暂不支持 `service log --follow`");
+            bail!("--machine 模式不支持 `service log --follow`");
         }
         let stdout = if log_path.exists() {
             fs::read_to_string(&log_path).unwrap_or_default()
         } else {
             String::new()
         };
-        return print_json(&serde_json::json!({
-            "ok": true,
-            "action": "service.log",
+        return print_machine(&serde_json::json!({
             "unit": launchd_label(&args.target.name),
             "path": log_path.display().to_string(),
             "stdout": stdout,

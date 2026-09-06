@@ -1,3 +1,5 @@
+#![allow(dead_code)]
+
 //! 集成测试共用：隔离 CLASH_CLI_HOME + 调用真实 `clash` 二进制。
 
 use std::fs;
@@ -46,11 +48,11 @@ pub fn run_with_home(home: &Path, args: &[&str]) -> Output {
         .expect("命令执行失败")
 }
 
-pub fn parse_json(output: &Output) -> serde_json::Value {
+pub fn parse_machine(output: &Output) -> serde_json::Value {
     let stdout = String::from_utf8_lossy(&output.stdout);
     serde_json::from_str(stdout.trim()).unwrap_or_else(|err| {
         panic!(
-            "stdout 不是 JSON: {err}\nstatus={:?}\nstdout={}\nstderr={}",
+            "stdout 不是 Machine Contract JSON: {err}\nstatus={:?}\nstdout={}\nstderr={}",
             output.status,
             stdout,
             String::from_utf8_lossy(&output.stderr)
@@ -58,7 +60,7 @@ pub fn parse_json(output: &Output) -> serde_json::Value {
     })
 }
 
-pub fn assert_json_ok(output: &Output) -> serde_json::Value {
+pub fn assert_machine_ok(output: &Output, action: &str) -> serde_json::Value {
     assert!(
         output.status.success(),
         "命令失败: status={:?} stdout={} stderr={}",
@@ -66,24 +68,27 @@ pub fn assert_json_ok(output: &Output) -> serde_json::Value {
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
     );
-    let value = parse_json(output);
-    assert_eq!(value["ok"], true, "JSON ok 不为 true: {value}");
+    let value = parse_machine(output);
+    assert_eq!(value["contract"], "clash.machine/v0");
+    assert_eq!(value["ok"], true);
+    assert_eq!(value["action"], action);
+    assert!(value["error"].is_null());
     value
 }
 
-pub fn assert_json_err(output: &Output) -> serde_json::Value {
+pub fn assert_machine_err(output: &Output, action: &str, code: &str) -> serde_json::Value {
     assert!(
         !output.status.success(),
         "期望失败却成功: stdout={} stderr={}",
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
     );
-    let value = parse_json(output);
-    assert_eq!(value["ok"], false, "失败 JSON 缺少 ok=false: {value}");
-    assert!(
-        value.get("error").and_then(|v| v.as_str()).is_some(),
-        "失败 JSON 缺少 error: {value}"
-    );
+    let value = parse_machine(output);
+    assert_eq!(value["contract"], "clash.machine/v0");
+    assert_eq!(value["ok"], false);
+    assert_eq!(value["status"], "failed");
+    assert_eq!(value["action"], action);
+    assert_eq!(value["error"]["code"], code);
     value
 }
 
@@ -105,7 +110,7 @@ pub fn write_profile(home: &Path, yaml: &str) {
         serde_json::to_vec_pretty(&index).expect("序列化索引失败"),
     )
     .expect("写入索引失败");
-    fs::write(profiles.join("main.yaml"), yaml).expect("写入 profile 失败");
+    fs::write(profiles.join("main.yaml"), yaml).expect("写入订阅失败");
 }
 
 pub fn read_runtime_yaml(home: &Path) -> serde_yaml::Value {
@@ -114,12 +119,4 @@ pub fn read_runtime_yaml(home: &Path) -> serde_yaml::Value {
         .unwrap_or_else(|err| panic!("读取 {} 失败: {err}", path.display()));
     serde_yaml::from_str(&text)
         .unwrap_or_else(|err| panic!("解析 runtime YAML 失败: {err}\n{text}"))
-}
-
-pub fn yaml_bool(root: &serde_yaml::Value, keys: &[&str]) -> Option<bool> {
-    let mut current = root;
-    for key in keys {
-        current = current.get(*key)?;
-    }
-    current.as_bool()
 }

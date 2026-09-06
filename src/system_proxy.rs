@@ -382,6 +382,79 @@ pub fn gnome_current_mode() -> Result<String> {
     )))
 }
 
+fn gsettings_get(schema: &str, key: &str) -> Result<String> {
+    let output = Command::new("gsettings")
+        .args(["get", schema, key])
+        .output()
+        .with_context(|| format!("读取 gsettings {schema} {key} 失败"))?;
+    if !output.status.success() {
+        bail!("读取 gsettings {schema} {key} 失败");
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+}
+
+fn parse_gsettings_u16(raw: &str) -> Option<u16> {
+    raw.split_whitespace().last()?.parse().ok()
+}
+
+fn gnome_proxy_matches_record(record: &SystemProxyRecord) -> Result<bool> {
+    let mode = parse_gsettings_string(&gsettings_get("org.gnome.system.proxy", "mode")?);
+    if mode != "manual" {
+        return Ok(false);
+    }
+    let http_host = parse_gsettings_string(&gsettings_get("org.gnome.system.proxy.http", "host")?);
+    let https_host =
+        parse_gsettings_string(&gsettings_get("org.gnome.system.proxy.https", "host")?);
+    let socks_host =
+        parse_gsettings_string(&gsettings_get("org.gnome.system.proxy.socks", "host")?);
+    let http_port = parse_gsettings_u16(&gsettings_get("org.gnome.system.proxy.http", "port")?);
+    let https_port = parse_gsettings_u16(&gsettings_get("org.gnome.system.proxy.https", "port")?);
+    let socks_port = parse_gsettings_u16(&gsettings_get("org.gnome.system.proxy.socks", "port")?);
+    Ok(http_host == record.host
+        && https_host == record.host
+        && socks_host == record.host
+        && http_port == Some(record.http_port)
+        && https_port == Some(record.http_port)
+        && socks_port == Some(record.socks_port))
+}
+
+fn endpoint_matches(endpoint: &MacosProxyEndpointState, host: &str, port: u16) -> bool {
+    endpoint.enabled && endpoint.server == host && endpoint.port == port
+}
+
+fn macos_proxy_matches_record(record: &SystemProxyRecord) -> Result<Option<bool>> {
+    if record.previous_macos.is_empty() {
+        return Ok(None);
+    }
+    for previous in &record.previous_macos {
+        let web =
+            parse_networksetup_proxy(&networksetup_text(&["-getwebproxy", &previous.service])?)?;
+        let secure = parse_networksetup_proxy(&networksetup_text(&[
+            "-getsecurewebproxy",
+            &previous.service,
+        ])?)?;
+        let socks = parse_networksetup_proxy(&networksetup_text(&[
+            "-getsocksfirewallproxy",
+            &previous.service,
+        ])?)?;
+        if !endpoint_matches(&web, &record.host, record.http_port)
+            || !endpoint_matches(&secure, &record.host, record.http_port)
+            || !endpoint_matches(&socks, &record.host, record.socks_port)
+        {
+            return Ok(Some(false));
+        }
+    }
+    Ok(Some(true))
+}
+
+/// 只读观测当前系统代理是否仍与 clash-cli 的 committed record 一致。
+pub fn observe_record_matches(record: &SystemProxyRecord) -> Result<Option<bool>> {
+    match record.backend {
+        SystemProxyBackend::Gnome => gnome_proxy_matches_record(record).map(Some),
+        SystemProxyBackend::Macos => macos_proxy_matches_record(record),
+    }
+}
+
 pub fn list_macos_services() -> Result<Vec<String>> {
     let output = Command::new("networksetup")
         .arg("-listallnetworkservices")
@@ -454,6 +527,24 @@ mod tests {
             cmds[0].args,
             ["set", "org.gnome.system.proxy", "mode", "auto"]
         );
+    }
+
+    #[test]
+    fn parse_gsettings_uint_port() {
+        assert_eq!(parse_gsettings_u16("uint32 7890\n"), Some(7890));
+        assert_eq!(parse_gsettings_u16("7891\n"), Some(7891));
+    }
+
+    #[test]
+    fn macos_endpoint_matching_requires_enabled_exact_endpoint() {
+        let endpoint = MacosProxyEndpointState {
+            enabled: true,
+            server: "127.0.0.1".into(),
+            port: 7890,
+            authenticated: false,
+        };
+        assert!(endpoint_matches(&endpoint, "127.0.0.1", 7890));
+        assert!(!endpoint_matches(&endpoint, "127.0.0.1", 7891));
     }
 
     #[test]

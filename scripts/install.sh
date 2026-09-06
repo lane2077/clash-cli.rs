@@ -4,8 +4,8 @@ set -euo pipefail
 REPO="lane2077/clash-cli.rs"
 VERSION="latest"
 MIRROR="auto"
-PROFILE_URL=""
-PROFILE_NAME="main"
+SUB_URL=""
+SUB_NAME="main"
 SERVICE_NAME="clash-mihomo"
 CLASH_HOME="/etc/clash-cli"
 WORKDIR="/var/lib/clash-cli"
@@ -25,8 +25,8 @@ usage() {
   --version TAG            CLI 版本，默认 latest（示例: v0.1.0）
   --mirror MODE            下载镜像: auto|ghfast|github，默认 auto
   --bin-path PATH          clash 安装路径，默认 /usr/local/bin/clash
-  --profile-url URL        订阅地址（提供后会自动执行 setup init）
-  --profile-name NAME      profile 名称，默认 main
+  --sub-url URL        订阅地址（提供后会自动执行 setup init）
+  --sub-name NAME      订阅名称，默认 main
   --service-name NAME      服务名（systemd/launchd），默认 clash-mihomo
   --home PATH              CLASH_CLI_HOME，默认 /etc/clash-cli
   --workdir PATH           service 工作目录，默认 /var/lib/clash-cli
@@ -54,12 +54,12 @@ while [[ $# -gt 0 ]]; do
       CLASH_BIN_PATH="${2:-}"
       shift 2
       ;;
-    --profile-url)
-      PROFILE_URL="${2:-}"
+    --sub-url)
+      SUB_URL="${2:-}"
       shift 2
       ;;
-    --profile-name)
-      PROFILE_NAME="${2:-}"
+    --sub-name)
+      SUB_NAME="${2:-}"
       shift 2
       ;;
     --service-name)
@@ -256,22 +256,22 @@ echo "下载来源: ${DOWNLOADED_URL}"
 
 if [[ "${SKIP_SETUP}" -eq 1 ]]; then
   echo "已完成二进制安装。你可稍后手动执行:"
-  echo "  sudo env CLASH_CLI_HOME=${CLASH_HOME} ${CLASH_BIN_PATH} setup init --profile-url <URL>"
+  echo "  sudo env CLASH_CLI_HOME=${CLASH_HOME} ${CLASH_BIN_PATH} setup init --sub-url <URL>"
   exit 0
 fi
 
-if [[ -z "${PROFILE_URL}" ]]; then
-  echo "未提供 --profile-url，已仅完成二进制安装。"
+if [[ -z "${SUB_URL}" ]]; then
+  echo "未提供 --sub-url，已仅完成二进制安装。"
   echo "后续执行:"
-  echo "  sudo env CLASH_CLI_HOME=${CLASH_HOME} ${CLASH_BIN_PATH} setup init --profile-url <URL>"
+  echo "  sudo env CLASH_CLI_HOME=${CLASH_HOME} ${CLASH_BIN_PATH} setup init --sub-url <URL>"
   exit 0
 fi
 
 echo "执行 setup init ..."
 CMD=(
   "${CLASH_BIN_PATH}" setup init
-  --profile-url "${PROFILE_URL}"
-  --profile-name "${PROFILE_NAME}"
+  --sub-url "${SUB_URL}"
+  --sub-name "${SUB_NAME}"
   --mirror "${MIRROR}"
   --service-name "${SERVICE_NAME}"
   --workdir "${WORKDIR}"

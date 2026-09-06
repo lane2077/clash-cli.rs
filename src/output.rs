@@ -1,77 +1,52 @@
-use std::io::IsTerminal;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::cell::{Cell, RefCell};
 
 use anyhow::{Context, Result};
 use serde::Serialize;
 
-static JSON_MODE: AtomicBool = AtomicBool::new(false);
+use crate::machine::ActionSemantics;
 
-pub fn set_json_mode(enabled: bool) {
-    JSON_MODE.store(enabled, Ordering::Relaxed);
+thread_local! {
+    static MACHINE_MODE: Cell<bool> = const { Cell::new(false) };
+    static MACHINE_ACTION: RefCell<String> = RefCell::new("unknown".to_string());
+    static MACHINE_MUTATING: Cell<bool> = const { Cell::new(false) };
 }
 
-pub fn is_json_mode() -> bool {
-    JSON_MODE.load(Ordering::Relaxed)
+pub fn set_machine_mode(enabled: bool) {
+    MACHINE_MODE.with(|value| value.set(enabled));
 }
 
-/// 终端默认给人看的中文；管道/脚本（非 TTY）默认 JSON，不必记 `--json`。
-/// `keep_raw_stdout` 用于 `proxy env`、`service log -f` 这类 stdout 本身就是产品。
-pub fn resolve_json_mode(
-    force_json: bool,
-    force_text: bool,
-    stdout_is_tty: bool,
-    keep_raw_stdout: bool,
-) -> bool {
-    if force_json {
-        return true;
+pub fn is_machine_mode() -> bool {
+    MACHINE_MODE.with(Cell::get)
+}
+
+pub fn set_machine_context(action: impl Into<String>, semantics: ActionSemantics) {
+    MACHINE_ACTION.with(|value| *value.borrow_mut() = action.into());
+    MACHINE_MUTATING.with(|value| value.set(semantics.mutating));
+}
+
+fn machine_action() -> String {
+    MACHINE_ACTION.with(|value| value.borrow().clone())
+}
+
+fn machine_semantics() -> ActionSemantics {
+    if MACHINE_MUTATING.with(Cell::get) {
+        ActionSemantics::WRITE
+    } else {
+        ActionSemantics::READ
     }
-    if force_text || keep_raw_stdout {
-        return false;
-    }
-    !stdout_is_tty
 }
 
-pub fn stdout_is_tty() -> bool {
-    std::io::stdout().is_terminal()
-}
-
-pub fn print_json<T: Serialize>(value: &T) -> Result<()> {
-    let text = serde_json::to_string_pretty(value).context("序列化 JSON 失败")?;
-    println!("{}", text);
+pub fn print_machine<T: Serialize>(value: &T) -> Result<()> {
+    let payload = serde_json::to_value(value).context("序列化机器输出失败")?;
+    let value = crate::machine::success_envelope(&payload, &machine_action(), machine_semantics());
+    let text = serde_json::to_string_pretty(&value).context("序列化机器输出失败")?;
+    println!("{text}");
     Ok(())
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn tty_defaults_to_text() {
-        assert!(!resolve_json_mode(false, false, true, false));
-    }
-
-    #[test]
-    fn pipe_defaults_to_json() {
-        assert!(resolve_json_mode(false, false, false, false));
-    }
-
-    #[test]
-    fn force_json_wins_on_tty() {
-        assert!(resolve_json_mode(true, false, true, false));
-    }
-
-    #[test]
-    fn force_text_wins_on_pipe() {
-        assert!(!resolve_json_mode(false, true, false, false));
-    }
-
-    #[test]
-    fn raw_stdout_commands_stay_text_on_pipe() {
-        assert!(!resolve_json_mode(false, false, false, true));
-    }
-
-    #[test]
-    fn force_json_overrides_raw_stdout() {
-        assert!(resolve_json_mode(true, false, false, true));
-    }
+pub fn print_machine_error(err: &anyhow::Error) -> Result<()> {
+    let value = crate::machine::error_envelope(err, &machine_action());
+    let text = serde_json::to_string_pretty(&value).context("序列化机器错误失败")?;
+    println!("{text}");
+    Ok(())
 }

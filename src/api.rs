@@ -11,7 +11,8 @@ use crate::cli::{
     ApiCommand, ApiCommonArgs, ApiConfigPatchArgs, ApiLogsArgs, ApiModeCommand, ApiProxySwitchArgs,
 };
 use crate::constants;
-use crate::output::{is_json_mode, print_json};
+use crate::machine::{ErrorCode, coded_error};
+use crate::output::{is_machine_mode, print_machine};
 use crate::paths::app_paths;
 
 #[derive(Debug, Clone)]
@@ -23,19 +24,31 @@ struct ApiContext {
 pub fn run(command: ApiCommand) -> Result<()> {
     match command {
         ApiCommand::Status(common) => cmd_status(common),
-        ApiCommand::Mode { action, common } => cmd_mode(action, common),
-        ApiCommand::Proxies(common) => cmd_proxies(common),
         ApiCommand::Connections(common) => cmd_connections(common),
-        ApiCommand::UiUrl(common) => cmd_ui_url(common),
         ApiCommand::Rules(common) => cmd_rules(common),
         ApiCommand::Configs(common) => cmd_configs(common),
         ApiCommand::Providers(common) => cmd_providers(common),
-        ApiCommand::ProxySwitch(args) => cmd_proxy_switch(args),
         ApiCommand::CloseConnections(common) => cmd_close_connections(common),
         ApiCommand::ConfigPatch(args) => cmd_config_patch(args),
         ApiCommand::Traffic(common) => cmd_traffic(common),
         ApiCommand::Logs(args) => cmd_logs(args),
     }
+}
+
+pub fn run_mode(action: ApiModeCommand, common: ApiCommonArgs) -> Result<()> {
+    cmd_mode(action, common)
+}
+
+pub fn run_proxy_list(common: ApiCommonArgs) -> Result<()> {
+    cmd_proxies(common)
+}
+
+pub fn run_proxy_switch(args: ApiProxySwitchArgs) -> Result<()> {
+    cmd_proxy_switch(args)
+}
+
+pub fn run_ui_url(common: ApiCommonArgs) -> Result<()> {
+    cmd_ui_url(common)
 }
 
 fn cmd_status(common: ApiCommonArgs) -> Result<()> {
@@ -48,10 +61,8 @@ fn cmd_status(common: ApiCommonArgs) -> Result<()> {
         Err(_) => api_get(&client, &ctx, "/configs")?,
     };
 
-    if is_json_mode() {
-        return print_json(&serde_json::json!({
-            "ok": true,
-            "action": "api.status",
+    if is_machine_mode() {
+        return print_machine(&serde_json::json!({
             "controller": ctx.base_url,
             "response": response
         }));
@@ -79,10 +90,8 @@ fn cmd_mode(action: ApiModeCommand, common: ApiCommonArgs) -> Result<()> {
                 .and_then(|v| v.as_str())
                 .unwrap_or("unknown");
 
-            if is_json_mode() {
-                return print_json(&serde_json::json!({
-                    "ok": true,
-                    "action": "api.mode.get",
+            if is_machine_mode() {
+                return print_machine(&serde_json::json!({
                     "mode": mode,
                     "response": response
                 }));
@@ -95,10 +104,8 @@ fn cmd_mode(action: ApiModeCommand, common: ApiCommonArgs) -> Result<()> {
             let payload = serde_json::json!({ "mode": target });
             let response = api_patch(&client, &ctx, "/configs", payload)?;
 
-            if is_json_mode() {
-                return print_json(&serde_json::json!({
-                    "ok": true,
-                    "action": "api.mode.set",
+            if is_machine_mode() {
+                return print_machine(&serde_json::json!({
                     "mode": target,
                     "response": response
                 }));
@@ -116,10 +123,8 @@ fn cmd_proxies(common: ApiCommonArgs) -> Result<()> {
     let response = api_get(&client, &ctx, "/proxies")?;
     let groups = summarize_proxy_groups(&response);
 
-    if is_json_mode() {
-        return print_json(&serde_json::json!({
-            "ok": true,
-            "action": "api.proxies",
+    if is_machine_mode() {
+        return print_machine(&serde_json::json!({
             "groups": groups_to_json(&groups),
             "response": response
         }));
@@ -134,10 +139,8 @@ fn cmd_connections(common: ApiCommonArgs) -> Result<()> {
     let ctx = load_api_context(&common)?;
     let response = api_get(&client, &ctx, "/connections")?;
 
-    if is_json_mode() {
-        return print_json(&serde_json::json!({
-            "ok": true,
-            "action": "api.connections",
+    if is_machine_mode() {
+        return print_machine(&serde_json::json!({
             "response": response
         }));
     }
@@ -152,10 +155,8 @@ fn cmd_ui_url(common: ApiCommonArgs) -> Result<()> {
     let ui = load_runtime_ui_fields(&paths.runtime_config_file)?;
     let dashboard = build_dashboard_url(&ctx.base_url);
 
-    if is_json_mode() {
-        return print_json(&serde_json::json!({
-            "ok": true,
-            "action": "api.ui-url",
+    if is_machine_mode() {
+        return print_machine(&serde_json::json!({
             "controller": ctx.base_url,
             "dashboard_url": dashboard,
             "external_ui": ui.external_ui,
@@ -198,11 +199,16 @@ fn load_api_context(common: &ApiCommonArgs) -> Result<ApiContext> {
     let paths = app_paths()?;
 
     let (config_controller, config_secret) = load_runtime_api_fields(&paths.runtime_config_file)?;
-    let controller = common
-        .controller
-        .clone()
-        .or(config_controller)
-        .unwrap_or_else(|| constants::DEFAULT_CONTROLLER.to_string());
+    let controller = match common.controller.clone().or(config_controller) {
+        Some(controller) => controller,
+        None if is_machine_mode() => {
+            return Err(coded_error(
+                ErrorCode::ExplicitInputRequired,
+                "机器调用缺少 controller：请显式提供 --controller，或先渲染包含 external-controller 的 runtime 配置",
+            ));
+        }
+        None => constants::DEFAULT_CONTROLLER.to_string(),
+    };
     let secret = common.secret.clone().or(config_secret);
 
     Ok(ApiContext {
@@ -217,7 +223,12 @@ fn load_runtime_api_fields(path: &std::path::Path) -> Result<(Option<String>, Op
     }
     let content =
         fs::read_to_string(path).with_context(|| format!("读取配置失败: {}", path.display()))?;
-    let root: YamlValue = serde_yaml::from_str(&content).context("解析 runtime 配置失败")?;
+    let root: YamlValue = serde_yaml::from_str(&content).map_err(|err| {
+        coded_error(
+            ErrorCode::ConfigInvalid,
+            format!("解析 runtime 配置失败 {}: {err}", path.display()),
+        )
+    })?;
     let controller = yaml_key_string(&root, "external-controller");
     let secret = yaml_key_string(&root, "secret");
     Ok((controller, secret))
@@ -229,7 +240,12 @@ fn load_runtime_ui_fields(path: &std::path::Path) -> Result<RuntimeUiFields> {
     }
     let content =
         fs::read_to_string(path).with_context(|| format!("读取配置失败: {}", path.display()))?;
-    let root: YamlValue = serde_yaml::from_str(&content).context("解析 runtime 配置失败")?;
+    let root: YamlValue = serde_yaml::from_str(&content).map_err(|err| {
+        coded_error(
+            ErrorCode::ConfigInvalid,
+            format!("解析 runtime 配置失败 {}: {err}", path.display()),
+        )
+    })?;
     Ok(RuntimeUiFields {
         external_ui: yaml_key_string(&root, "external-ui"),
         external_ui_name: yaml_key_string(&root, "external-ui-name"),
@@ -315,10 +331,8 @@ fn cmd_rules(common: ApiCommonArgs) -> Result<()> {
     let ctx = load_api_context(&common)?;
     let response = api_get(&client, &ctx, "/rules")?;
 
-    if is_json_mode() {
-        return print_json(&serde_json::json!({
-            "ok": true,
-            "action": "api.rules",
+    if is_machine_mode() {
+        return print_machine(&serde_json::json!({
             "response": response
         }));
     }
@@ -346,10 +360,8 @@ fn cmd_configs(common: ApiCommonArgs) -> Result<()> {
     let ctx = load_api_context(&common)?;
     let response = api_get(&client, &ctx, "/configs")?;
 
-    if is_json_mode() {
-        return print_json(&serde_json::json!({
-            "ok": true,
-            "action": "api.configs",
+    if is_machine_mode() {
+        return print_machine(&serde_json::json!({
             "response": response
         }));
     }
@@ -377,10 +389,8 @@ fn cmd_providers(common: ApiCommonArgs) -> Result<()> {
     let ctx = load_api_context(&common)?;
     let response = api_get(&client, &ctx, "/providers/proxies")?;
 
-    if is_json_mode() {
-        return print_json(&serde_json::json!({
-            "ok": true,
-            "action": "api.providers",
+    if is_machine_mode() {
+        return print_machine(&serde_json::json!({
             "response": response
         }));
     }
@@ -414,10 +424,8 @@ fn cmd_proxy_switch(args: ApiProxySwitchArgs) -> Result<()> {
     let payload = serde_json::json!({ "name": args.proxy });
     let response = api_put(&client, &ctx, &path, payload)?;
 
-    if is_json_mode() {
-        return print_json(&serde_json::json!({
-            "ok": true,
-            "action": "api.proxy-switch",
+    if is_machine_mode() {
+        return print_machine(&serde_json::json!({
             "group": args.group,
             "proxy": args.proxy,
             "response": response
@@ -433,10 +441,8 @@ fn cmd_close_connections(common: ApiCommonArgs) -> Result<()> {
     let ctx = load_api_context(&common)?;
     let response = api_delete(&client, &ctx, "/connections")?;
 
-    if is_json_mode() {
-        return print_json(&serde_json::json!({
-            "ok": true,
-            "action": "api.close-connections",
+    if is_machine_mode() {
+        return print_machine(&serde_json::json!({
             "response": response
         }));
     }
@@ -452,10 +458,8 @@ fn cmd_config_patch(args: ApiConfigPatchArgs) -> Result<()> {
     let ctx = load_api_context(&args.common)?;
     let response = api_patch(&client, &ctx, "/configs", payload)?;
 
-    if is_json_mode() {
-        return print_json(&serde_json::json!({
-            "ok": true,
-            "action": "api.config-patch",
+    if is_machine_mode() {
+        return print_machine(&serde_json::json!({
             "response": response
         }));
     }
@@ -479,10 +483,8 @@ fn cmd_traffic(common: ApiCommonArgs) -> Result<()> {
         .lines()
         .find_map(|line| serde_json::from_str::<JsonValue>(line).ok());
 
-    if is_json_mode() {
-        return print_json(&serde_json::json!({
-            "ok": true,
-            "action": "api.traffic",
+    if is_machine_mode() {
+        return print_machine(&serde_json::json!({
             "snapshot": snapshot
         }));
     }
@@ -511,10 +513,8 @@ fn cmd_logs(args: ApiLogsArgs) -> Result<()> {
         .take(50)
         .collect();
 
-    if is_json_mode() {
-        return print_json(&serde_json::json!({
-            "ok": true,
-            "action": "api.logs",
+    if is_machine_mode() {
+        return print_machine(&serde_json::json!({
             "count": entries.len(),
             "entries": entries
         }));
